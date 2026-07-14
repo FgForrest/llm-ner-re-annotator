@@ -1,0 +1,462 @@
+x-gpu-deploy-extractor: &gpu-deploy-extractor
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            # Default 1 (single-GPU bezpečný fallback). Pro 2/4× B200 nastav
+            # EXTRACTOR_TP_SIZE před `docker compose up`, nebo použij
+            # ./scripts/run_production.sh / run_smoke_test.sh (interaktivní
+            # prompt 1/2/4). Pozn.: pokud zde bude 2 a host má jen 1 GPU,
+            # nvidia-container-cli vyhodí "device error: 1: unknown device".
+            count: ${EXTRACTOR_TP_SIZE:-1}
+            capabilities: [gpu]
+  shm_size: "32gb"
+  ulimits:
+    memlock: -1
+    stack: 67108864
+
+x-gpu-deploy-critic: &gpu-deploy-critic
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: ${CRITIC_TP_SIZE:-1}
+            capabilities: [gpu]
+  shm_size: "16gb"
+  ulimits:
+    memlock: -1
+    stack: 67108864
+
+x-label-vols: &label-vols
+  - ${DATA_DIR:-./data}:/app/data:ro
+  - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+
+services:
+
+  # =========================================================================
+  # POŽADAVKY: CUDA 13+ runtime na hostu
+  # =========================================================================
+  # Všechny LLM image tagy musí být postavené proti CUDA 13 (NVFP4 vyžaduje
+  # 5th-gen Tensor Cores na Blackwell SM120, které jsou plně podporované
+  # až ve CUDA 13+ a odpovídajícím NVIDIA driveru ≥ 580).
+  #
+  # Default tagy:
+  #   - SGLang:  lmsysorg/sglang:latest-cu130   (cu130 = CUDA 13.0)
+  #   - vLLM:    vllm/vllm-openai:latest (cu130 build)
+  #
+  # Pokud používáš starší CUDA driver, dostaneš:
+  #   "CUDA error: no kernel image is available for execution on the device"
+  # → upgrade NVIDIA driver na ≥580 (CUDA 13.0 capable) a CUDA toolkit ≥13.0.
+
+  # =========================================================================
+  # EXTRACTOR — Qwen3.5-122B-A10B (default NVFP4)
+  # =========================================================================
+  # SGLang (preferovaný — Qwen3 native podpora, dobrý batching pro MoE).
+  # POŽADAVEK: CUDA 13+ runtime (image tag obsahuje "-cu130").
+  extractor-sglang:
+    profiles: ["extract-sglang", "revise-sglang"]
+    image: ${SGLANG_IMAGE:-lmsysorg/sglang:latest-cu130}
+    container_name: mudrc-extractor
+    restart: unless-stopped
+    environment:
+      - HF_HOME=/models
+      # HF_HUB_ENABLE_HF_TRANSFER je deprecated v novém huggingface_hub
+      # (hf_transfer balíček už není ani používaný). Replacement je
+      # HF_XET_HIGH_PERFORMANCE pro Xet-based vysokorychlostní download.
+      - HF_XET_HIGH_PERFORMANCE=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Suppress noisy DeprecationWarning z nvidia_cutlass_dsl (libka
+      # interní, nemůžeme ji ovlivnit) + obecné DeprecationWarning z
+      # huggingface_hub / vllm / sglang. Errory zůstávají vidět.
+      - PYTHONWARNINGS=ignore::DeprecationWarning,ignore::FutureWarning
+      # transformers má vlastní logger (ne Python warnings) — `torch_dtype
+      # is deprecated! Use dtype instead!` apod. Verbosity=error potlačí
+      # warning úroveň; real errory / tracebacky vidíme dál.
+      - TRANSFORMERS_VERBOSITY=error
+      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+    volumes:
+      - ${MODEL_CACHE_DIR:-./models}:/models
+    command:
+      - sh
+      - -c
+      - |
+        QUANT_FLAG=""
+        if [ -n "${EXTRACTOR_QUANTIZATION:-}" ]; then
+          QUANT_FLAG="--quantization=${EXTRACTOR_QUANTIZATION:-}"
+        fi
+        # Per-container override (EXTRACTOR_*) má prioritu nad globálním fallbackem.
+        EFF_PIECEWISE="${EXTRACTOR_DISABLE_PIECEWISE_CUDA_GRAPH:-${DISABLE_PIECEWISE_CUDA_GRAPH:-}}"
+        PIECEWISE_FLAG=""
+        if [ "$$EFF_PIECEWISE" = "1" ] || [ "$$EFF_PIECEWISE" = "true" ]; then
+          PIECEWISE_FLAG="--disable-piecewise-cuda-graph"
+        fi
+        exec python3 -m sglang.launch_server \
+          --model-path=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4} \
+          --host=0.0.0.0 \
+          --port=8000 \
+          --tp=${EXTRACTOR_TP_SIZE:-1} \
+          --mem-fraction-static=0.85 \
+          --max-running-requests=${EXTRACTOR_BATCH_SIZE:-32} \
+          --context-length=${EXTRACTOR_CONTEXT_LEN:-65536} \
+          --reasoning-parser=qwen3 \
+          --trust-remote-code \
+          $$QUANT_FLAG $$PIECEWISE_FLAG
+    ports: ["8000:8000"]
+    <<: *gpu-deploy-extractor
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8000/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      # Cold-start prostor VČETNĚ prvního stažení vah z HF (Qwen ~80 GB může
+      # trvat desítky minut). Laditelné přes LLM_HEALTH_START_PERIOD v .env —
+      # na pomalé lince zvyš (např. 7200s). Velká hodnota NEzpomaluje teplé
+      # starty: healthy se hlásí hned po prvním úspěšném checku.
+      start_period: ${LLM_HEALTH_START_PERIOD:-3600s}
+
+  # vLLM (fallback — používá flashinfer_cutlass MoE backend pro NVFP4).
+  # POŽADAVEK: CUDA 13+ runtime (image tag musí obsahovat "-cu130" nebo musí
+  # být explicitně postaven proti CUDA 13).
+  extractor-vllm:
+    profiles: ["extract-vllm", "revise-vllm"]
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: mudrc-extractor
+    restart: unless-stopped
+    environment:
+      - HF_HOME=/models
+      # HF_HUB_ENABLE_HF_TRANSFER je deprecated v novém huggingface_hub
+      # (hf_transfer balíček už není ani používaný). Replacement je
+      # HF_XET_HIGH_PERFORMANCE pro Xet-based vysokorychlostní download.
+      - HF_XET_HIGH_PERFORMANCE=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Suppress noisy DeprecationWarning z nvidia_cutlass_dsl (libka
+      # interní, nemůžeme ji ovlivnit) + obecné DeprecationWarning z
+      # huggingface_hub / vllm / sglang. Errory zůstávají vidět.
+      - PYTHONWARNINGS=ignore::DeprecationWarning,ignore::FutureWarning
+      # transformers má vlastní logger (ne Python warnings) — `torch_dtype
+      # is deprecated! Use dtype instead!` apod. Verbosity=error potlačí
+      # warning úroveň; real errory / tracebacky vidíme dál.
+      - TRANSFORMERS_VERBOSITY=error
+      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+    volumes:
+      - ${MODEL_CACHE_DIR:-./models}:/models
+    # Quantization flag se aplikuje na základě EXTRACTOR_QUANTIZATION env.
+    command:
+      - sh
+      - -c
+      - |
+        QUANT_FLAG=""
+        if [ -n "${EXTRACTOR_QUANTIZATION:-}" ]; then
+          QUANT_FLAG="--quantization=${EXTRACTOR_QUANTIZATION:-}"
+        fi
+        # Pro NVFP4 MoE Qwen3.5 je nutný flashinfer_cutlass MoE backend
+        MOE_FLAG=""
+        if [ -n "${EXTRACTOR_QUANTIZATION:-}" ]; then
+          MOE_FLAG="--moe_backend=flashinfer_cutlass"
+        fi
+        exec python3 -m vllm.entrypoints.openai.api_server \
+          --model=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4} \
+          --host=0.0.0.0 \
+          --port=8000 \
+          --tensor-parallel-size=${EXTRACTOR_TP_SIZE:-2} \
+          --gpu-memory-utilization=0.85 \
+          --max-num-seqs=${EXTRACTOR_BATCH_SIZE:-32} \
+          --max-model-len=${EXTRACTOR_CONTEXT_LEN:-65536} \
+          --reasoning-parser=qwen3 \
+          --language-model-only \
+          $$QUANT_FLAG $$MOE_FLAG
+    ports: ["8000:8000"]
+    <<: *gpu-deploy-extractor
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8000/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      # Cold-start prostor VČETNĚ prvního stažení vah z HF (Qwen ~80 GB může
+      # trvat desítky minut). Laditelné přes LLM_HEALTH_START_PERIOD v .env —
+      # na pomalé lince zvyš (např. 7200s). Velká hodnota NEzpomaluje teplé
+      # starty: healthy se hlásí hned po prvním úspěšném checku.
+      start_period: ${LLM_HEALTH_START_PERIOD:-3600s}
+
+  # =========================================================================
+  # CRITIC — Gemma 4 31B (default NVFP4, ~16 GB)
+  # =========================================================================
+  # SGLang (preferovaný)
+  critic-sglang:
+    profiles: ["critic-sglang"]
+    image: ${SGLANG_IMAGE:-lmsysorg/sglang:latest-cu130}
+    container_name: mudrc-critic
+    restart: unless-stopped
+    environment:
+      - HF_HOME=/models
+      # HF_HUB_ENABLE_HF_TRANSFER je deprecated v novém huggingface_hub
+      # (hf_transfer balíček už není ani používaný). Replacement je
+      # HF_XET_HIGH_PERFORMANCE pro Xet-based vysokorychlostní download.
+      - HF_XET_HIGH_PERFORMANCE=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Suppress noisy DeprecationWarning z nvidia_cutlass_dsl (libka
+      # interní, nemůžeme ji ovlivnit) + obecné DeprecationWarning z
+      # huggingface_hub / vllm / sglang. Errory zůstávají vidět.
+      - PYTHONWARNINGS=ignore::DeprecationWarning,ignore::FutureWarning
+      # transformers má vlastní logger (ne Python warnings) — `torch_dtype
+      # is deprecated! Use dtype instead!` apod. Verbosity=error potlačí
+      # warning úroveň; real errory / tracebacky vidíme dál.
+      - TRANSFORMERS_VERBOSITY=error
+      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+    volumes:
+      - ${MODEL_CACHE_DIR:-./models}:/models
+    command:
+      - sh
+      - -c
+      - |
+        QUANT_FLAG=""
+        if [ -n "${CRITIC_QUANTIZATION:-}" ]; then
+          QUANT_FLAG="--quantization=${CRITIC_QUANTIZATION:-}"
+        fi
+        # Per-container override (CRITIC_*) má prioritu nad globálním fallbackem.
+        EFF_PIECEWISE="${CRITIC_DISABLE_PIECEWISE_CUDA_GRAPH:-${DISABLE_PIECEWISE_CUDA_GRAPH:-}}"
+        PIECEWISE_FLAG=""
+        if [ "$$EFF_PIECEWISE" = "1" ] || [ "$$EFF_PIECEWISE" = "true" ]; then
+          PIECEWISE_FLAG="--disable-piecewise-cuda-graph"
+        fi
+        exec python3 -m sglang.launch_server \
+          --model-path=${CRITIC_MODEL:-nvidia/Gemma-4-31B-IT-NVFP4} \
+          --host=0.0.0.0 \
+          --port=8001 \
+          --tp=${CRITIC_TP_SIZE:-1} \
+          --mem-fraction-static=0.85 \
+          --max-running-requests=${CRITIC_BATCH_SIZE:-64} \
+          --context-length=${CRITIC_CONTEXT_LEN:-65536} \
+          $$QUANT_FLAG $$PIECEWISE_FLAG
+    ports: ["8001:8001"]
+    <<: *gpu-deploy-critic
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8001/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      # Cold-start prostor VČETNĚ prvního stažení vah z HF. Laditelné přes
+      # LLM_HEALTH_START_PERIOD v .env (na pomalé lince zvyš, např. 7200s).
+      start_period: ${LLM_HEALTH_START_PERIOD:-3600s}
+
+  # vLLM (fallback — oficiální NVIDIA NVFP4 checkpoint je vLLM-targeted).
+  # POŽADAVEK: CUDA 13+ runtime (image tag musí obsahovat "-cu130").
+  critic-vllm:
+    profiles: ["critic-vllm"]
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: mudrc-critic
+    restart: unless-stopped
+    environment:
+      - HF_HOME=/models
+      # HF_HUB_ENABLE_HF_TRANSFER je deprecated v novém huggingface_hub
+      # (hf_transfer balíček už není ani používaný). Replacement je
+      # HF_XET_HIGH_PERFORMANCE pro Xet-based vysokorychlostní download.
+      - HF_XET_HIGH_PERFORMANCE=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Suppress noisy DeprecationWarning z nvidia_cutlass_dsl (libka
+      # interní, nemůžeme ji ovlivnit) + obecné DeprecationWarning z
+      # huggingface_hub / vllm / sglang. Errory zůstávají vidět.
+      - PYTHONWARNINGS=ignore::DeprecationWarning,ignore::FutureWarning
+      # transformers má vlastní logger (ne Python warnings) — `torch_dtype
+      # is deprecated! Use dtype instead!` apod. Verbosity=error potlačí
+      # warning úroveň; real errory / tracebacky vidíme dál.
+      - TRANSFORMERS_VERBOSITY=error
+      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+    volumes:
+      - ${MODEL_CACHE_DIR:-./models}:/models
+    command:
+      - sh
+      - -c
+      - |
+        QUANT_FLAG=""
+        if [ -n "${CRITIC_QUANTIZATION:-}" ]; then
+          QUANT_FLAG="--quantization=${CRITIC_QUANTIZATION:-}"
+        fi
+        exec python3 -m vllm.entrypoints.openai.api_server \
+          --model=${CRITIC_MODEL:-nvidia/Gemma-4-31B-IT-NVFP4} \
+          --host=0.0.0.0 \
+          --port=8001 \
+          --tensor-parallel-size=${CRITIC_TP_SIZE:-1} \
+          --gpu-memory-utilization=0.85 \
+          --max-num-seqs=${CRITIC_BATCH_SIZE:-64} \
+          --max-model-len=${CRITIC_CONTEXT_LEN:-65536} \
+          --reasoning-parser=gemma4 \
+          --limit-mm-per-prompt='{"image":0}' \
+          $$QUANT_FLAG
+    ports: ["8001:8001"]
+    <<: *gpu-deploy-critic
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8001/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      # Cold-start prostor VČETNĚ prvního stažení vah z HF. Laditelné přes
+      # LLM_HEALTH_START_PERIOD v .env (na pomalé lince zvyš, např. 7200s).
+      start_period: ${LLM_HEALTH_START_PERIOD:-3600s}
+
+  # =========================================================================
+  # LABELERS (Python HTTP klienti)
+  # =========================================================================
+  labeler-extract-vllm:
+    profiles: ["extract-vllm"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      extractor-vllm: { condition: service_healthy }
+    environment:
+      - EXTRACTOR_BASE_URL=http://extractor-vllm:8000/v1
+      - EXTRACTOR_MODEL=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4}
+      - EXTRACTOR_CONCURRENCY=${EXTRACTOR_CONCURRENCY:-32}
+      - EXTRACTOR_REASONING=${EXTRACTOR_REASONING:-false}
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+      - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
+      - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
+      - EXTRACTOR_NER_MAX_TOKENS=${EXTRACTOR_NER_MAX_TOKENS:-8192}
+      - EXTRACTOR_SPLIT_REPETITION_PENALTY=${EXTRACTOR_SPLIT_REPETITION_PENALTY:-1.05}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
+    volumes: *label-vols
+    command: >
+      extract ${EXTRACT_EXTRA_ARGS:-}
+    restart: "no"
+
+  labeler-extract-sglang:
+    profiles: ["extract-sglang"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      extractor-sglang: { condition: service_healthy }
+    environment:
+      - EXTRACTOR_BASE_URL=http://extractor-sglang:8000/v1
+      - EXTRACTOR_MODEL=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4}
+      - EXTRACTOR_CONCURRENCY=${EXTRACTOR_CONCURRENCY:-32}
+      - EXTRACTOR_REASONING=${EXTRACTOR_REASONING:-false}
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+      - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
+      - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
+      - EXTRACTOR_NER_MAX_TOKENS=${EXTRACTOR_NER_MAX_TOKENS:-8192}
+      - EXTRACTOR_SPLIT_REPETITION_PENALTY=${EXTRACTOR_SPLIT_REPETITION_PENALTY:-1.05}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
+    volumes: *label-vols
+    command: >
+      extract ${EXTRACT_EXTRA_ARGS:-}
+    restart: "no"
+
+  # Critic (Gemma) — fáze 2. Běží sama na GPU, bez extractoru. Critic uloží
+  # verdikt + reasoning + corrected (pokud status='revised'), ale nikoliv
+  # extractor_revised — to dělá až fáze 2b (labeler-revise-{backend}).
+  labeler-critic-vllm:
+    profiles: ["critic-vllm"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      critic-vllm: { condition: service_healthy }
+    environment:
+      - CRITIC_BASE_URL=http://critic-vllm:8001/v1
+      - CRITIC_MODEL=${CRITIC_MODEL:-nvidia/Gemma-4-31B-IT-NVFP4}
+      - CRITIC_CONCURRENCY=${CRITIC_CONCURRENCY:-64}
+      - CRITIC_REASONING=${CRITIC_REASONING:-true}
+      - CRITIC_MAX_TOKENS=${CRITIC_MAX_TOKENS:-49152}
+      - CRITIC_SPLIT_REPETITION_PENALTY=${CRITIC_SPLIT_REPETITION_PENALTY:-1.05}
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+      - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
+      - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
+    volumes: *label-vols
+    command: ["critic"]
+    restart: "no"
+
+  labeler-critic-sglang:
+    profiles: ["critic-sglang"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      critic-sglang: { condition: service_healthy }
+    environment:
+      - CRITIC_BASE_URL=http://critic-sglang:8001/v1
+      - CRITIC_MODEL=${CRITIC_MODEL:-nvidia/Gemma-4-31B-IT-NVFP4}
+      - CRITIC_CONCURRENCY=${CRITIC_CONCURRENCY:-64}
+      - CRITIC_REASONING=${CRITIC_REASONING:-true}
+      - CRITIC_MAX_TOKENS=${CRITIC_MAX_TOKENS:-49152}
+      - CRITIC_SPLIT_REPETITION_PENALTY=${CRITIC_SPLIT_REPETITION_PENALTY:-1.05}
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+      - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
+      - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
+    volumes: *label-vols
+    command: ["critic"]
+    restart: "no"
+
+  # Fáze 2b — revisor (defaultně Qwen — stejný jako extractor) projde
+  # critic_results, pro non-ok záznamy zavolá revisora a doplní extractor_revised.
+  # Běží sám na GPU, bez critica (Gemma). Defaultně používá EXTRACTOR_* env;
+  # pro jiný model/endpoint nastav REVISOR_* v .env.
+  labeler-revise-vllm:
+    profiles: ["revise-vllm"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      extractor-vllm: { condition: service_healthy }
+    environment:
+      - EXTRACTOR_BASE_URL=http://extractor-vllm:8000/v1
+      - EXTRACTOR_MODEL=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4}
+      - EXTRACTOR_REASONING=${EXTRACTOR_REASONING:-false}
+      - EXTRACTOR_CONCURRENCY=${EXTRACTOR_CONCURRENCY:-32}
+      - EXTRACTOR_MAX_TOKENS=${EXTRACTOR_MAX_TOKENS:-24576}
+      # REVISOR_*: pokud nejsou v .env, config.py si je odvodí z EXTRACTOR_*.
+      - REVISOR_BASE_URL
+      - REVISOR_MODEL
+      - REVISOR_REASONING
+      - REVISOR_CONCURRENCY
+      - REVISOR_MAX_TOKENS
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+      - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
+      - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
+    volumes: *label-vols
+    command: ["revise"]
+    restart: "no"
+
+  labeler-revise-sglang:
+    profiles: ["revise-sglang"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      extractor-sglang: { condition: service_healthy }
+    environment:
+      - EXTRACTOR_BASE_URL=http://extractor-sglang:8000/v1
+      - EXTRACTOR_MODEL=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4}
+      - EXTRACTOR_REASONING=${EXTRACTOR_REASONING:-false}
+      - EXTRACTOR_CONCURRENCY=${EXTRACTOR_CONCURRENCY:-32}
+      - EXTRACTOR_MAX_TOKENS=${EXTRACTOR_MAX_TOKENS:-24576}
+      # REVISOR_*: pokud nejsou v .env, config.py si je odvodí z EXTRACTOR_*.
+      - REVISOR_BASE_URL
+      - REVISOR_MODEL
+      - REVISOR_REASONING
+      - REVISOR_CONCURRENCY
+      - REVISOR_MAX_TOKENS
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+      - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
+      - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
+    volumes: *label-vols
+    command: ["revise"]
+    restart: "no"
+
+  # =========================================================================
+  # FINALIZE — merge + stats (bez LLM)
+  # =========================================================================
+  labeler-finalize:
+    profiles: ["finalize"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    environment:
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+      - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
+      - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
+    volumes:
+      - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+    command: ["finalize"]
+    restart: "no"

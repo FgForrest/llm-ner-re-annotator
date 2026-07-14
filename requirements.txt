@@ -1,0 +1,12 @@
+httpx==0.28.1
+pydantic==2.10.4
+# Deterministická lemmatizace entit ve finalize (labeler/lemma.py) — Stanza
+# se používá VÝHRADNĚ na lemma. Volitelná za běhu: bez ní se lemmatizace
+# přeskočí (best-effort) a zůstanou LLM lemmata. Model (~STANZA_LANG, default
+# cs) se při prvním použití stáhne automaticky do ~/stanza_resources.
+stanza==1.11.1
+# RDF/OWL output (jen pro smoke-test --phase finalize, nepoužívá se v produkční pipeline)
+rdflib==7.1.1
+# Volitelné: HTML dokumentace pro vygenerovaný .owl (pip install pylode); pokud
+# není přítomno, smoke test prostě HTML doc nevyrobí — .owl je tam tak jako tak.
+# pylode==3.2.0

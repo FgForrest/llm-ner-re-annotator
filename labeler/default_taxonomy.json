@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "mode": "off",
+  "notes": "DEFAULT fallback taxonomie (16 kategorií) jako DATA — jediné místo, kde je default set definovaný. Z tohoto souboru se za běhu odvozuje DEFAULT_LABEL_MAPPING (přes Taxonomy.label_mapping()) i DEFAULT_NER_LABELS (přes Taxonomy.ner_label_targets()) — v Python kódu žádná hard-coded tabulka jmen labelů není. Používá se JEN když neexistuje entity_taxonomy.json z fáze 0 (ta má vždy přednost). Pole 'kind': 'ner' = tvrdá NER kategorie (krátké pojmenovatelné spany), 'keyphrase' = delší popisné fráze (mimo core NER trénink, prefix KEYPHRASE_). Pole 'remap_to': cílový label po normalizaci (prázdné = odvodí se z kind).",
+  "labels": [
+    {
+      "code": "PRODUKT",
+      "description": "Konkrétní pojmenovaný produkt nebo služba — to, co lze koupit, objednat nebo sjednat.",
+      "kind": "ner"
+    },
+    {
+      "code": "KATEGORIE",
+      "description": "Typ produktu nebo služby obecně (kategorie), bez konkrétního názvu.",
+      "kind": "ner",
+      "remap_to": "PRODUKT_TYP"
+    },
+    {
+      "code": "ORGANIZACE",
+      "description": "Firma, instituce, značka nebo jiný organizační subjekt.",
+      "kind": "ner"
+    },
+    {
+      "code": "OSOBA",
+      "description": "Jmenovaná fyzická osoba i obecná role/funkce osoby (klient, řidič, lékárník).",
+      "kind": "ner",
+      "remap_to": "OSOBA_ROLE"
+    },
+    {
+      "code": "MISTO",
+      "description": "Skutečné geografické místo, adresa, region nebo stát.",
+      "kind": "ner"
+    },
+    {
+      "code": "DATUM",
+      "description": "Konkrétní datum nebo časový interval.",
+      "kind": "ner"
+    },
+    {
+      "code": "HODNOTA",
+      "description": "Konkrétní číselná hodnota — peníze, množství, parametr s jednotkou.",
+      "kind": "ner"
+    },
+    {
+      "code": "MATERIAL",
+      "description": "Materiál nebo surovina, ze které je produkt vyroben.",
+      "kind": "ner"
+    },
+    {
+      "code": "KOMPONENTA",
+      "description": "Část nebo složka produktu (procesor, balkón, investiční složka).",
+      "kind": "keyphrase"
+    },
+    {
+      "code": "PARAMETR",
+      "description": "Měřitelná vlastnost nebo parametr produktu (kapacita RAM, limit plnění).",
+      "kind": "keyphrase"
+    },
+    {
+      "code": "VLASTNOST",
+      "description": "Kvalitativní popis bez přiřaditelné číselné hodnoty (voděodolný, kompaktní).",
+      "kind": "keyphrase",
+      "remap_to": "KEYPHRASE_PROPERTY"
+    },
+    {
+      "code": "BENEFIT",
+      "description": "Přínos pro uživatele (celodenní práce bez nabíjení, ochrana před ztrátou).",
+      "kind": "keyphrase"
+    },
+    {
+      "code": "POUZITI",
+      "description": "Kontext použití, scénář, riziko nebo cílová skupina.",
+      "kind": "keyphrase",
+      "remap_to": "KEYPHRASE_USECASE"
+    },
+    {
+      "code": "TECHNOLOGIE",
+      "description": "Technologie, metoda nebo inovace (Intel Evo, tepelné čerpadlo, Face ID).",
+      "kind": "keyphrase",
+      "remap_to": "KEYPHRASE_TECH"
+    },
+    {
+      "code": "SPECIFIKACE",
+      "description": "Norma, standard, certifikace nebo protokol (IP68, GDPR, Bluetooth 5.3).",
+      "kind": "keyphrase",
+      "remap_to": "KEYPHRASE_SPEC"
+    },
+    {
+      "code": "SUBJEKT",
+      "description": "Generický fallback pro věcný pojem, který nesedí do žádné jiné kategorie.",
+      "kind": "keyphrase",
+      "remap_to": "KEYPHRASE_SUBJECT"
+    }
+  ]
+}

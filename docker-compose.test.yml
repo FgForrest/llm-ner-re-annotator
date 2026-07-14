@@ -1,0 +1,188 @@
+services:
+  # Smoke test používá `lmsysorg/sglang:latest-cu130` = nejnovější SGLang build
+  # explicitně proti CUDA 13.0 (default `:latest` má CUDA 12.9). Konzistentní
+  # s produkcí — host musí mít NVIDIA driver ≥ 580 / CUDA 13+. Mini BF16
+  # modely (Qwen3-0.6B, Gemma-3-1b) tak běží na stejném runtime jako produkce.
+  #
+  # Extractor (Qwen3-0.6B) — používá se sólo ve dvou různých rolích:
+  #   profile test-extract  → primární extrakce (fáze 1)
+  #   profile test-revise   → revisor (fáze 2b — projde uložené critic_results
+  #                           a doplní extractor_revised). Critic v té době
+  #                           neběží, takže VRAM je celá pro extractor.
+  extractor-sglang:
+    profiles: ["test-extract", "test-revise"]
+    image: lmsysorg/sglang:latest-cu130
+    container_name: mudrc-test-extractor
+    environment:
+      - HF_HOME=/models
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+    volumes:
+      - ${MODEL_CACHE_DIR:-./models}:/models
+    # SGLang piecewise CUDA graph workaround — defaultně vypnutý.
+    # Per-container EXTRACTOR_DISABLE_PIECEWISE_CUDA_GRAPH má prioritu;
+    # globální DISABLE_PIECEWISE_CUDA_GRAPH funguje jako fallback.
+    # Hodnoty 1 / true → flag --disable-piecewise-cuda-graph se přidá.
+    command:
+      - sh
+      - -c
+      - |
+        EFF_PIECEWISE="${EXTRACTOR_DISABLE_PIECEWISE_CUDA_GRAPH:-${DISABLE_PIECEWISE_CUDA_GRAPH:-}}"
+        PIECEWISE_FLAG=""
+        if [ "$$EFF_PIECEWISE" = "1" ] || [ "$$EFF_PIECEWISE" = "true" ]; then
+          PIECEWISE_FLAG="--disable-piecewise-cuda-graph"
+        fi
+        exec python3 -m sglang.launch_server \
+          --model-path=${TEST_EXTRACTOR_MODEL:-Qwen/Qwen3-0.6B} \
+          --host=0.0.0.0 \
+          --port=8000 \
+          --tp=1 \
+          --mem-fraction-static=0.70 \
+          --max-running-requests=2 \
+          --context-length=12288 \
+          --dtype=bfloat16 \
+          $$PIECEWISE_FLAG
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8000/v1/models || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 300s
+
+  labeler-extract-sglang:
+    profiles: ["test-extract"]
+    build:
+      context: .
+      dockerfile: Dockerfile.labeler
+    depends_on:
+      extractor-sglang:
+        condition: service_healthy
+    environment:
+      - EXTRACTOR_BASE_URL=http://extractor-sglang:8000/v1
+      - EXTRACTOR_MODEL=${TEST_EXTRACTOR_MODEL:-Qwen/Qwen3-0.6B}
+      - EXTRACTOR_CONCURRENCY=2
+      - EXTRACTOR_REASONING=false
+      - EXTRACTOR_MAX_TOKENS=2048
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+    volumes:
+      - ${DATA_DIR:-./data}:/app/data:ro
+      - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+    command: >
+      extract
+      --limit 3
+    restart: "no"
+
+  # Critic (Gemma-3-1b) — fáze 2 (sama na GPU). Critic už neumí inline feedback
+  # — revisor (Qwen) přijde v samostatné fázi 2b s profilem test-revise.
+  # GPU tak drží vždy jen jeden model najednou.
+  critic-sglang:
+    profiles: ["test-critic"]
+    image: lmsysorg/sglang:latest-cu130
+    container_name: mudrc-test-critic
+    environment:
+      - HF_HOME=/models
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+    volumes:
+      - ${MODEL_CACHE_DIR:-./models}:/models
+    # SGLang piecewise CUDA graph workaround — defaultně vypnutý.
+    # Per-container CRITIC_DISABLE_PIECEWISE_CUDA_GRAPH má prioritu;
+    # globální DISABLE_PIECEWISE_CUDA_GRAPH funguje jako fallback.
+    command:
+      - sh
+      - -c
+      - |
+        EFF_PIECEWISE="${CRITIC_DISABLE_PIECEWISE_CUDA_GRAPH:-${DISABLE_PIECEWISE_CUDA_GRAPH:-}}"
+        PIECEWISE_FLAG=""
+        if [ "$$EFF_PIECEWISE" = "1" ] || [ "$$EFF_PIECEWISE" = "true" ]; then
+          PIECEWISE_FLAG="--disable-piecewise-cuda-graph"
+        fi
+        exec python3 -m sglang.launch_server \
+          --model-path=${TEST_CRITIC_MODEL:-google/gemma-3-1b-it} \
+          --host=0.0.0.0 \
+          --port=8001 \
+          --tp=1 \
+          --mem-fraction-static=0.70 \
+          --max-running-requests=2 \
+          --context-length=12288 \
+          --dtype=bfloat16 \
+          $$PIECEWISE_FLAG
+    ports:
+      - "8001:8001"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8001/v1/models || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 300s
+
+  labeler-critic-sglang:
+    profiles: ["test-critic"]
+    build:
+      context: .
+      dockerfile: Dockerfile.labeler
+    depends_on:
+      critic-sglang:
+        condition: service_healthy
+    environment:
+      - CRITIC_BASE_URL=http://critic-sglang:8001/v1
+      - CRITIC_MODEL=${TEST_CRITIC_MODEL:-google/gemma-3-1b-it}
+      - CRITIC_CONCURRENCY=2
+      - CRITIC_REASONING=false
+      - CRITIC_MAX_TOKENS=2048
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+    volumes:
+      - ${DATA_DIR:-./data}:/app/data:ro
+      - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+    # Critic běží sám (Gemma) — revisor (Qwen) přijde v samostatné fázi 2b
+    # přes profil test-revise. Tím modely nikdy neběží na GPU souběžně.
+    command: ["critic"]
+    restart: "no"
+
+  # Fáze 2b — standalone revisor: extractor (Qwen3-0.6B) projde uložené
+  # critic_results a doplní extractor_revised pro non-ok záznamy.
+  labeler-revise-sglang:
+    profiles: ["test-revise"]
+    build:
+      context: .
+      dockerfile: Dockerfile.labeler
+    depends_on:
+      extractor-sglang:
+        condition: service_healthy
+    environment:
+      # Revisor = stejný endpoint a model jako extractor (Qwen3-0.6B).
+      # Config.py si REVISOR_* odvodí z EXTRACTOR_* defaultně.
+      - EXTRACTOR_BASE_URL=http://extractor-sglang:8000/v1
+      - EXTRACTOR_MODEL=${TEST_EXTRACTOR_MODEL:-Qwen/Qwen3-0.6B}
+      - EXTRACTOR_CONCURRENCY=2
+      - EXTRACTOR_REASONING=false
+      - EXTRACTOR_MAX_TOKENS=2048
+      - DATA_DIR=/app/data
+      - CHECKPOINT_DIR=/app/checkpoints
+    volumes:
+      - ${DATA_DIR:-./data}:/app/data:ro
+      - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+    command: ["revise"]
+    restart: "no"

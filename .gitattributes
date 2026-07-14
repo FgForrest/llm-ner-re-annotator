@@ -1,0 +1,27 @@
+# Enforce LF line endings for files that must be LF in Linux containers.
+# Windows klient by default converted to CRLF when git clone-ing, což
+# rozbije bash skripty uvnitř kontejnerů ("/usr/bin/env bash\r: not found").
+
+# Linux shell scripts — MUST be LF
+*.sh                text eol=lf
+
+# YAML a Docker files — MUST be LF (docker-compose na Linuxu je přísný)
+*.yml               text eol=lf
+*.yaml              text eol=lf
+Dockerfile*         text eol=lf
+.env*               text eol=lf
+
+# Python — LF preferovaný, ale Windows to jede s oběma
+*.py                text eol=lf
+
+# Text soubory — standardní handling
+*.md                text
+*.txt               text
+*.json              text
+
+# Binární soubory — nikdy nepřepisovat
+*.zip               binary
+*.tar.gz            binary
+*.pt                binary
+*.bin               binary
+*.safetensors       binary

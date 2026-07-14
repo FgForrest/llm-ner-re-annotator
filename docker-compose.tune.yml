@@ -1,0 +1,73 @@
+# =============================================================================
+# SAMOSTATNÝ compose pro benchmark/tuning souběžnosti extractoru.
+# ZÁMĚRNĚ mimo hlavní docker-compose.yml — produkční pipeline tím nezasahuje.
+#
+# Spouští se přes scripts/auto_tune_concurrency.sh, který volá:
+#   docker compose -f docker-compose.tune.yml run --rm labeler-tune-sglang \
+#       scripts/probe_concurrency.py ...
+#
+# Vzniknou DVA kontejnery:
+#   - extractor-sglang     SGLang server (zděděný z docker-compose.yml přes
+#                          `extends` → žádná duplikace nastavení; profiles:[]
+#                          ho dělá vždy aktivním i v tomhle samostatném souboru)
+#   - labeler-tune-sglang  Python kontejner s scripts/probe_concurrency.py
+#
+# Probe pošle dávky reálných extract requestů na různých úrovních souběžnosti,
+# změří runaway (finish_reason=length) a zapíše max stabilní N do mountnutého
+# checkpoints/tune/result.env, odkud ho .sh přečte a zapíše do .env.
+# =============================================================================
+
+services:
+  # SGLang extractor — zděděný z hlavního compose (1:1 model/quant/TP/healthcheck).
+  # profiles: [] přebije zděděné profily → služba je v tomhle souboru vždy
+  # aktivní (žádný --profile netřeba). Server batch pro tuning řídí .sh přes
+  # EXTRACTOR_BATCH_SIZE (--max-running-requests).
+  extractor-sglang:
+    extends:
+      file: docker-compose.yml
+      service: extractor-sglang
+    profiles: []
+
+  # Python probe kontejner (stejný image jako labeler). ENTRYPOINT image je
+  # `python -m labeler.main`; přepíšeme na holé `python` a celý command
+  # (probe + argy) dodá auto_tune_concurrency.sh přes `docker compose run`.
+  # scripts/ se mountuje (Dockerfile.labeler je nekopíruje).
+  labeler-tune-sglang:
+    profiles: ["extract-sglang"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      extractor-sglang: { condition: service_healthy }
+    environment:
+      - EXTRACTOR_BASE_URL=http://extractor-sglang:8000/v1
+      - EXTRACTOR_MODEL=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+    entrypoint: ["python"]
+    command: ["scripts/probe_concurrency.py", "--help"]
+    restart: "no"
+
+  # Critic SGLang server — zděděný z hlavního compose (Gemma-4-31B). profiles:[]
+  # → vždy aktivní; `docker compose run labeler-tune-critic` ho nahodí přes
+  # depends_on (extractor-sglang se nespustí, není závislost tune-critic).
+  critic-sglang:
+    extends:
+      file: docker-compose.yml
+      service: critic-sglang
+    profiles: []
+
+  # Python probe pro CRITIC roli (cílí na critic endpoint, --role critic).
+  labeler-tune-critic:
+    profiles: ["critic-sglang"]
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      critic-sglang: { condition: service_healthy }
+    environment:
+      - CRITIC_BASE_URL=http://critic-sglang:8001/v1
+      - CRITIC_MODEL=${CRITIC_MODEL:-nvidia/Gemma-4-31B-IT-NVFP4}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+    entrypoint: ["python"]
+    command: ["scripts/probe_concurrency.py", "--help"]
+    restart: "no"

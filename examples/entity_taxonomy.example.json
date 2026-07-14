@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "mode": "user",
+  "notes": "Příkladová uživatelská taxonomie — povinné labely + keyphrase pro e-shop a pojišťovnictví. Všechna jména firem a produktů jsou smyšlená (ACME, ALFA, DEMO…). Pipeline ji validuje a aplikuje místo defaultního 16-set. URL / EMAIL / TELEFON tu zÁměrnE NEJSOU — jsou to regex-detekovatelné struktury, ne NER kategorie (normalize je dropne). Spuštění: python -m labeler.main taxonomy --mode user --user-taxonomy examples/entity_taxonomy.example.json",
+  "source_datasets": [
+    "pojistovna-demo",
+    "eshop-demo",
+    "sperky-demo",
+    "kosmetika-demo"
+  ],
+  "labels": [
+    {
+      "code": "PRODUKT",
+      "description": "Konkrétní pojmenovaný produkt nebo služba — to, co lze koupit, objednat, sjednat nebo užít.",
+      "examples": [
+        "Pojištění auta OMEGA",
+        "ACME Basic",
+        "DEMO prsten Hvězda",
+        "Pleťová voda DEMO"
+      ],
+      "domains": ["e-shop", "pojišťovnictví", "kosmetika"],
+      "aliases": ["PRODUCT", "ITEM"],
+      "force_text_match": [
+        "ALFA", "BETA", "GAMA", "DELTA", "OMEGA", "AlfaPlus"
+      ],
+      "case_sensitive": true,
+      "unsafe_texts": [
+        "pojištění", "auto", "vozidlo", "škoda", "věc", "smlouva",
+        "online", "produkt", "služba", "klient", "uživatel"
+      ]
+    },
+    {
+      "code": "PRODUKT_TYP",
+      "description": "Typ produktu nebo služby obecně (kategorie), bez konkrétního názvu.",
+      "examples": [
+        "životní pojištění",
+        "firemní notebook",
+        "obklady do koupelny",
+        "péče o pleť"
+      ],
+      "domains": ["e-shop", "pojišťovnictví"],
+      "aliases": ["CATEGORY", "PRODUCT_TYPE", "KATEGORIE"],
+      "force_text_match": [
+        "životní pojištění", "neživotní pojištění", "havarijní pojištění",
+        "flotilové pojištění", "pojištění domácnosti", "pojištění majetku",
+        "pojištění odpovědnosti", "povinné ručení", "cestovní pojištění",
+        "úrazové pojištění", "připojištění"
+      ],
+      "case_sensitive": false,
+      "unsafe_texts": [
+        "pojištění", "auto", "smlouva", "online"
+      ]
+    },
+    {
+      "code": "ORGANIZACE",
+      "description": "Firma, instituce, značka, výrobce.",
+      "examples": [
+        "ACME Pojišťovna",
+        "DEMO šperky",
+        "ACME",
+        "Kosmetika Vzor a.s."
+      ],
+      "domains": ["e-shop", "pojišťovnictví", "kosmetika"],
+      "aliases": ["ORG", "COMPANY", "BRAND"]
+    },
+    {
+      "code": "OSOBA_ROLE",
+      "description": "Konkrétní role osoby (pojistník, makléř, lékárník) — ne jmenovaná osoba.",
+      "examples": ["pojistník", "lékárník", "makléř", "kosmetička"],
+      "domains": ["pojišťovnictví", "kosmetika"],
+      "aliases": ["OSOBA", "PERSON_ROLE"]
+    },
+    {
+      "code": "MISTO",
+      "description": "Skutečné geografické místo (město, region, stát, adresa). NIKDY URL.",
+      "examples": ["Praha", "Slovenská republika", "Žižkov", "Sokolov"],
+      "domains": ["e-shop", "pojišťovnictví"],
+      "aliases": ["LOCATION", "PLACE", "CITY"]
+    },
+    {
+      "code": "DATUM",
+      "description": "Konkrétní datum, časový interval nebo doba platnosti.",
+      "examples": ["1. 1. 2026", "12 měsíců", "od 2024 do 2026"],
+      "domains": ["pojišťovnictví", "e-shop"],
+      "aliases": ["DATE", "TIME"]
+    },
+    {
+      "code": "HODNOTA",
+      "description": "Konkrétní číselná hodnota — peníze, množství, parametr s jednotkou.",
+      "examples": ["100 000 Kč", "25 zirkonů", "78 m²", "Ag 925/1000"],
+      "domains": ["e-shop", "pojišťovnictví", "kosmetika"],
+      "aliases": ["VALUE", "AMOUNT"]
+    },
+    {
+      "code": "MATERIAL",
+      "description": "Materiál nebo surovina, ze které je produkt vyroben.",
+      "examples": ["stříbro Ag 925", "mosaz", "cihla", "kůže"],
+      "domains": ["e-shop"],
+      "aliases": ["MATERIAL_TYPE"]
+    },
+    {
+      "code": "KEYPHRASE_BENEFIT",
+      "description": "Přínos pro uživatele (delší fráze, mimo tvrdé NER, hodí se pro keyphrase extraction).",
+      "examples": [
+        "celodenní práce bez nabíjení",
+        "ochrana před finanční ztrátou",
+        "klidné bydlení v centru"
+      ],
+      "domains": ["e-shop", "pojišťovnictví"],
+      "aliases": ["BENEFIT"]
+    },
+    {
+      "code": "KEYPHRASE_USECASE",
+      "description": "Kontext použití, scénář, pojistné riziko, cílová skupina.",
+      "examples": [
+        "škoda způsobená živelní pohromou",
+        "rodiny s dětmi",
+        "denní použití na cesty",
+        "škoda způsobená vytopením bytu"
+      ],
+      "domains": ["pojišťovnictví", "e-shop"],
+      "aliases": ["POUZITI", "USECASE"]
+    },
+    {
+      "code": "KEYPHRASE_PARAMETR",
+      "description": "Měřitelná vlastnost nebo parametr produktu (delší keyphrase).",
+      "examples": ["kapacita RAM", "limit pojistného plnění", "doba platnosti"],
+      "domains": ["e-shop", "pojišťovnictví"],
+      "aliases": ["PARAMETR"]
+    }
+  ]
+}
