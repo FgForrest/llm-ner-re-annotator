@@ -1,0 +1,534 @@
+[
+  {
+    "item_id": "demo-outdoor:products:1001",
+    "source_dataset": "demo-outdoor",
+    "input_text": "Turistický batoh ALFA Trek 30 od značky ACME Outdoor má objem 30 litrů a váží 1,1 kg. Je vyrobený z recyklovaného polyesteru a má odvětrávané ramenní popruhy. Hodí se na jednodenní túry v horách.",
+    "input_hash": "bc147fc3e4d3dd30",
+    "is_synthetic": false,
+    "graph": {
+      "entities": [
+        {
+          "id": "e1",
+          "text": "Turistický batoh",
+          "lemma": "turistický batoh",
+          "category": "PRODUKT_TYP",
+          "start_char": 0,
+          "end_char": 16
+        },
+        {
+          "id": "e2",
+          "text": "ALFA Trek 30",
+          "lemma": "ALFA Trek 30",
+          "category": "PRODUKT",
+          "start_char": 17,
+          "end_char": 29
+        },
+        {
+          "id": "e3",
+          "text": "ACME Outdoor",
+          "lemma": "ACME Outdoor",
+          "category": "ORGANIZACE",
+          "start_char": 40,
+          "end_char": 52
+        },
+        {
+          "id": "e5",
+          "text": "30 litrů",
+          "lemma": "30 litr",
+          "category": "HODNOTA",
+          "start_char": 62,
+          "end_char": 70
+        },
+        {
+          "id": "e6",
+          "text": "1,1 kg",
+          "lemma": "1 , 1 kilogram",
+          "category": "HODNOTA",
+          "start_char": 78,
+          "end_char": 84
+        },
+        {
+          "id": "e7",
+          "text": "recyklovaného polyesteru",
+          "lemma": "recyklovaný polyester",
+          "category": "MATERIAL",
+          "start_char": 100,
+          "end_char": 124
+        }
+      ],
+      "relations": [
+        {
+          "subjectId": "e2",
+          "objectId": "e1",
+          "relation": "is_a",
+          "relationCs": "je",
+          "relationEn": "is_a"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e3",
+          "relation": "manufactured_by",
+          "relationCs": "vyrábí",
+          "relationEn": "manufactured_by"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e7",
+          "relation": "made_of",
+          "relationCs": "je vyroben z",
+          "relationEn": "made_of"
+        }
+      ],
+      "triples": [
+        {
+          "subject": "ALFA Trek 30",
+          "relation": "is_a",
+          "object": "turistický batoh"
+        },
+        {
+          "subject": "ALFA Trek 30",
+          "relation": "manufactured_by",
+          "object": "ACME Outdoor"
+        },
+        {
+          "subject": "ALFA Trek 30",
+          "relation": "made_of",
+          "object": "recyklovaný polyester"
+        }
+      ]
+    },
+    "critic_status": "ok",
+    "critic_reasoning": "Entity i relace odpovídají textu.",
+    "revisor_reasoning": null,
+    "final_graph_source": "extractor_original",
+    "changes_applied": {
+      "entities_added": [],
+      "entities_removed": [],
+      "relations_added": [],
+      "relations_removed": []
+    },
+    "extractor_model": "RedHatAI/Qwen3.5-122B-A10B-NVFP4",
+    "critic_model": "nvidia/Gemma-4-31B-IT-NVFP4",
+    "was_revised": false,
+    "keyphrases": {
+      "entities": [
+        {
+          "id": "e4",
+          "text": "objem",
+          "lemma": "objem",
+          "category": "KEYPHRASE_PARAMETR",
+          "start_char": 56,
+          "end_char": 61
+        },
+        {
+          "id": "e8",
+          "text": "ramenní popruhy",
+          "lemma": "ramenní popruha",
+          "category": "KEYPHRASE_KOMPONENTA",
+          "start_char": 142,
+          "end_char": 157
+        },
+        {
+          "id": "e9",
+          "text": "jednodenní túry v horách",
+          "lemma": "jednodenní túr v hora",
+          "category": "KEYPHRASE_USECASE",
+          "start_char": 170,
+          "end_char": 194
+        }
+      ],
+      "relations": [
+        {
+          "subjectId": "e2",
+          "objectId": "e4",
+          "relation": "has_parameter",
+          "relationCs": "má parametr",
+          "relationEn": "has_parameter"
+        },
+        {
+          "subjectId": "e4",
+          "objectId": "e5",
+          "relation": "has_value",
+          "relationCs": "má hodnotu",
+          "relationEn": "has_value"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e8",
+          "relation": "has_component",
+          "relationCs": "má komponentu",
+          "relationEn": "has_component"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e9",
+          "relation": "suitable_for",
+          "relationCs": "vhodný pro",
+          "relationEn": "suitable_for"
+        }
+      ],
+      "triples": [
+        {
+          "subject": "ALFA Trek 30",
+          "relation": "has_parameter",
+          "object": "objem"
+        },
+        {
+          "subject": "objem",
+          "relation": "has_value",
+          "object": "30 litr"
+        },
+        {
+          "subject": "ALFA Trek 30",
+          "relation": "has_component",
+          "object": "ramenní popruha"
+        },
+        {
+          "subject": "ALFA Trek 30",
+          "relation": "suitable_for",
+          "object": "jednodenní túr v hora"
+        }
+      ]
+    }
+  },
+  {
+    "item_id": "demo-outdoor:products:1002",
+    "source_dataset": "demo-outdoor",
+    "input_text": "Lehká bunda BETA Shell od ACME Outdoor je ze třívrstvé membrány s vodním sloupcem 20 000 mm. Kapuce je nastavitelná a zipy jsou vodoodpudivé. Bunda je vhodná do deště i na skialpinismus.",
+    "input_hash": "0f63f252d33ad868",
+    "is_synthetic": false,
+    "graph": {
+      "entities": [
+        {
+          "id": "e1",
+          "text": "bunda",
+          "lemma": "bunda",
+          "category": "PRODUKT_TYP",
+          "start_char": 6,
+          "end_char": 11
+        },
+        {
+          "id": "e2",
+          "text": "BETA Shell",
+          "lemma": "BETA Shell",
+          "category": "PRODUKT",
+          "start_char": 12,
+          "end_char": 22
+        },
+        {
+          "id": "e3",
+          "text": "ACME Outdoor",
+          "lemma": "ACME Outdoor",
+          "category": "ORGANIZACE",
+          "start_char": 26,
+          "end_char": 38
+        },
+        {
+          "id": "e6",
+          "text": "20 000 mm",
+          "lemma": "20 000 milimetr",
+          "category": "HODNOTA",
+          "start_char": 82,
+          "end_char": 91
+        }
+      ],
+      "relations": [
+        {
+          "subjectId": "e2",
+          "objectId": "e1",
+          "relation": "is_a",
+          "relationCs": "je",
+          "relationEn": "is_a"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e3",
+          "relation": "manufactured_by",
+          "relationCs": "vyrábí",
+          "relationEn": "manufactured_by"
+        }
+      ],
+      "triples": [
+        {
+          "subject": "BETA Shell",
+          "relation": "is_a",
+          "object": "bunda"
+        },
+        {
+          "subject": "BETA Shell",
+          "relation": "manufactured_by",
+          "object": "ACME Outdoor"
+        }
+      ]
+    },
+    "critic_status": "revised",
+    "critic_reasoning": "Chybí komponenta 'Kapuce' zmíněná ve druhé větě.",
+    "revisor_reasoning": "Kritika je oprávněná, kapuce je komponenta bundy.",
+    "final_graph_source": "extractor_revised",
+    "changes_applied": {
+      "entities_added": [
+        "kapuce (KOMPONENTA)"
+      ],
+      "entities_removed": [],
+      "relations_added": [
+        "beta shell -has_component-> kapuce"
+      ],
+      "relations_removed": []
+    },
+    "extractor_model": "RedHatAI/Qwen3.5-122B-A10B-NVFP4",
+    "critic_model": "nvidia/Gemma-4-31B-IT-NVFP4",
+    "was_revised": true,
+    "keyphrases": {
+      "entities": [
+        {
+          "id": "e4",
+          "text": "třívrstvé membrány",
+          "lemma": "třívrstvý membrána",
+          "category": "KEYPHRASE_KOMPONENTA",
+          "start_char": 45,
+          "end_char": 63
+        },
+        {
+          "id": "e5",
+          "text": "vodním sloupcem",
+          "lemma": "vodní sloupec",
+          "category": "KEYPHRASE_PARAMETR",
+          "start_char": 66,
+          "end_char": 81
+        },
+        {
+          "id": "e7",
+          "text": "Kapuce",
+          "lemma": "kapuce",
+          "category": "KEYPHRASE_KOMPONENTA",
+          "start_char": 93,
+          "end_char": 99
+        },
+        {
+          "id": "e8",
+          "text": "skialpinismus",
+          "lemma": "skialpinismus",
+          "category": "KEYPHRASE_USECASE",
+          "start_char": 172,
+          "end_char": 185
+        }
+      ],
+      "relations": [
+        {
+          "subjectId": "e2",
+          "objectId": "e4",
+          "relation": "has_component",
+          "relationCs": "má komponentu",
+          "relationEn": "has_component"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e5",
+          "relation": "has_parameter",
+          "relationCs": "má parametr",
+          "relationEn": "has_parameter"
+        },
+        {
+          "subjectId": "e5",
+          "objectId": "e6",
+          "relation": "has_value",
+          "relationCs": "má hodnotu",
+          "relationEn": "has_value"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e8",
+          "relation": "suitable_for",
+          "relationCs": "vhodný pro",
+          "relationEn": "suitable_for"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e7",
+          "relation": "has_component",
+          "relationCs": "má komponentu",
+          "relationEn": "has_component"
+        }
+      ],
+      "triples": [
+        {
+          "subject": "BETA Shell",
+          "relation": "has_component",
+          "object": "třívrstvý membrána"
+        },
+        {
+          "subject": "BETA Shell",
+          "relation": "has_parameter",
+          "object": "vodní sloupec"
+        },
+        {
+          "subject": "vodní sloupec",
+          "relation": "has_value",
+          "object": "20 000 milimetr"
+        },
+        {
+          "subject": "BETA Shell",
+          "relation": "suitable_for",
+          "object": "skialpinismus"
+        },
+        {
+          "subject": "BETA Shell",
+          "relation": "has_component",
+          "object": "kapuce"
+        }
+      ]
+    }
+  },
+  {
+    "item_id": "demo-outdoor:blog:edeePage_1",
+    "source_dataset": "demo-outdoor",
+    "input_text": "Pro jednodenní výlet stačí batoh s objemem 20 až 30 litrů. Na vícedenní přechod hor se hodí batoh s objemem nad 45 litrů a nastavitelným zádovým systémem. Prodejna ACME Outdoor v Brně vám batoh ráda seřídí.",
+    "input_hash": "dcd60537198fef1d",
+    "is_synthetic": false,
+    "graph": {
+      "entities": [
+        {
+          "id": "e2",
+          "text": "batoh",
+          "lemma": "batoh",
+          "category": "PRODUKT_TYP",
+          "start_char": 27,
+          "end_char": 32
+        },
+        {
+          "id": "e4",
+          "text": "20 až 30 litrů",
+          "lemma": "20 až 30 litr",
+          "category": "HODNOTA",
+          "start_char": 43,
+          "end_char": 57
+        },
+        {
+          "id": "e6",
+          "text": "ACME Outdoor",
+          "lemma": "ACME Outdoor",
+          "category": "ORGANIZACE",
+          "start_char": 164,
+          "end_char": 176
+        },
+        {
+          "id": "e7",
+          "text": "Brně",
+          "lemma": "Brno",
+          "category": "MISTO",
+          "start_char": 179,
+          "end_char": 183
+        }
+      ],
+      "relations": [
+        {
+          "subjectId": "e6",
+          "objectId": "e7",
+          "relation": "located_in",
+          "relationCs": "nachází se v",
+          "relationEn": "located_in"
+        }
+      ],
+      "triples": [
+        {
+          "subject": "ACME Outdoor",
+          "relation": "located_in",
+          "object": "Brno"
+        }
+      ]
+    },
+    "critic_status": "ok",
+    "critic_reasoning": "Entity i relace odpovídají textu.",
+    "revisor_reasoning": null,
+    "final_graph_source": "extractor_original",
+    "changes_applied": {
+      "entities_added": [],
+      "entities_removed": [],
+      "relations_added": [],
+      "relations_removed": []
+    },
+    "extractor_model": "RedHatAI/Qwen3.5-122B-A10B-NVFP4",
+    "critic_model": "nvidia/Gemma-4-31B-IT-NVFP4",
+    "was_revised": false,
+    "keyphrases": {
+      "entities": [
+        {
+          "id": "e1",
+          "text": "jednodenní výlet",
+          "lemma": "jednodenní výlet",
+          "category": "KEYPHRASE_USECASE",
+          "start_char": 4,
+          "end_char": 20
+        },
+        {
+          "id": "e3",
+          "text": "objemem",
+          "lemma": "objem",
+          "category": "KEYPHRASE_PARAMETR",
+          "start_char": 35,
+          "end_char": 42
+        },
+        {
+          "id": "e5",
+          "text": "zádovým systémem",
+          "lemma": "zádový systém",
+          "category": "KEYPHRASE_KOMPONENTA",
+          "start_char": 137,
+          "end_char": 153
+        }
+      ],
+      "relations": [
+        {
+          "subjectId": "e2",
+          "objectId": "e1",
+          "relation": "suitable_for",
+          "relationCs": "vhodný pro",
+          "relationEn": "suitable_for"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e3",
+          "relation": "has_parameter",
+          "relationCs": "má parametr",
+          "relationEn": "has_parameter"
+        },
+        {
+          "subjectId": "e3",
+          "objectId": "e4",
+          "relation": "has_value",
+          "relationCs": "má hodnotu",
+          "relationEn": "has_value"
+        },
+        {
+          "subjectId": "e2",
+          "objectId": "e5",
+          "relation": "has_component",
+          "relationCs": "má komponentu",
+          "relationEn": "has_component"
+        }
+      ],
+      "triples": [
+        {
+          "subject": "batoh",
+          "relation": "suitable_for",
+          "object": "jednodenní výlet"
+        },
+        {
+          "subject": "batoh",
+          "relation": "has_parameter",
+          "object": "objem"
+        },
+        {
+          "subject": "objem",
+          "relation": "has_value",
+          "object": "20 až 30 litr"
+        },
+        {
+          "subject": "batoh",
+          "relation": "has_component",
+          "object": "zádový systém"
+        }
+      ]
+    }
+  }
+]

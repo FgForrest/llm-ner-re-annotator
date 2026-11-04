@@ -1,0 +1,84 @@
+{
+  "version": 2,
+  "mode": "EMBEDDED",
+  "exportedAt": "2026-01-01T00:00:00Z",
+  "dataset": {
+    "name": "demo-outdoor",
+    "path": "demo-outdoor",
+    "description": "Fictitious demo e-shop with outdoor gear. All names and texts are made up for documentation purposes."
+  },
+  "schemas": [
+    {
+      "name": "products",
+      "code": "products",
+      "allowedLocales": ["cs"],
+      "fields": [
+        {"code": "name", "name": "Název", "type": "STRING", "localized": true},
+        {"code": "brandName", "name": "Značka", "type": "STRING", "localized": false},
+        {"code": "description", "name": "Popis", "type": "HTML", "localized": true},
+        {"code": "parameters", "name": "Parametry", "type": "STRING", "localized": true}
+      ],
+      "relations": [],
+      "records": [
+        {
+          "id": "1001",
+          "fields": [
+            {"code": "externalId", "value": "1001", "locale": null},
+            {"code": "brandName", "value": "ACME Outdoor", "locale": null},
+            {"code": "name", "value": "ALFA Trek 30", "locale": "cs"},
+            {"code": "description", "value": "<p>Turistický batoh ALFA Trek 30 od značky ACME Outdoor má objem 30 litrů a váží 1,1 kg. Je vyrobený z recyklovaného polyesteru a má odvětrávané ramenní popruhy. Hodí se na jednodenní túry v horách.</p>", "locale": "cs"},
+            {"code": "parameters", "value": "Objem: 30 l; Hmotnost: 1,1 kg; Materiál: recyklovaný polyester", "locale": "cs"}
+          ],
+          "related": []
+        },
+        {
+          "id": "1002",
+          "fields": [
+            {"code": "externalId", "value": "1002", "locale": null},
+            {"code": "brandName", "value": "ACME Outdoor", "locale": null},
+            {"code": "name", "value": "BETA Shell", "locale": "cs"},
+            {"code": "description", "value": "<p>Lehká bunda BETA Shell od ACME Outdoor je ze třívrstvé membrány s vodním sloupcem 20 000 mm. Kapuce je nastavitelná a zipy jsou vodoodpudivé. Bunda je vhodná do deště i na skialpinismus.</p>", "locale": "cs"},
+            {"code": "parameters", "value": "Vodní sloupec: 20 000 mm; Membrána: třívrstvá; Hmotnost: 380 g", "locale": "cs"}
+          ],
+          "related": []
+        }
+      ]
+    },
+    {
+      "name": "blog",
+      "code": "blog",
+      "allowedLocales": ["cs"],
+      "fields": [
+        {"code": "title", "name": "Titulek", "type": "STRING", "localized": true},
+        {"code": "content", "name": "Obsah", "type": "HTML", "localized": true}
+      ],
+      "relations": [],
+      "records": [
+        {
+          "id": "edeePage_1",
+          "fields": [
+            {"code": "externalId", "value": "edeePage_1", "locale": null},
+            {"code": "objectType", "value": "edeePage", "locale": null},
+            {"code": "prototype", "value": "article", "locale": null},
+            {"code": "url", "value": "/blog/jak-vybrat-batoh", "locale": "cs"},
+            {"code": "title", "value": "Jak vybrat turistický batoh", "locale": "cs"},
+            {"code": "content", "value": "<p>Pro jednodenní výlet stačí batoh s objemem 20 až 30 litrů. Na vícedenní přechod hor se hodí batoh s objemem nad 45 litrů a nastavitelným zádovým systémem. Prodejna ACME Outdoor v Brně vám batoh ráda seřídí.</p>", "locale": "cs"}
+          ],
+          "related": []
+        },
+        {
+          "id": "edeePage_2",
+          "fields": [
+            {"code": "externalId", "value": "edeePage_2", "locale": null},
+            {"code": "objectType", "value": "edeePage", "locale": null},
+            {"code": "prototype", "value": "alertStrip", "locale": null},
+            {"code": "url", "value": "/system/lista", "locale": "cs"},
+            {"code": "title", "value": "Lišta", "locale": "cs"},
+            {"code": "content", "value": "Letní výprodej: slevy až 30 % na vybrané stany a spacáky.", "locale": "cs"}
+          ],
+          "related": []
+        }
+      ]
+    }
+  ]
+}

@@ -1038,6 +1038,9 @@ mkdir -p data
 cp /path/to/export/export-mujdataset-latest.json data/
 ```
 
+A complete fictitious input (Stage export + `labeler_config.json`) and the
+matching `final_labels` output are in [examples/](examples/README.md).
+
 ### 1b. Build the labeler image
 
 ```bash
@@ -1334,7 +1337,8 @@ mudrc-labeler/
 
 ## Output format
 
-`final_labels.jsonl` — one record per line:
+`final_labels.jsonl` — one record per line (a full example generated from a
+fictitious input is in [examples/output/](examples/output/final_labels.json)):
 
 ```json
 {
