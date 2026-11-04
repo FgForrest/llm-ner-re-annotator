@@ -1,4 +1,4 @@
-# Zastavi SGLang server bezici z start_native_llm.ps1.
+﻿# Zastavi SGLang server bezici z start_native_llm.ps1.
 # Pouziti: .\scripts\stop_native_llm.ps1 <port>
 
 param([Parameter(Mandatory=$true)][int]$Port)
@@ -24,7 +24,7 @@ if (-not $proc) {
 
 # ---------------------------------------------------------------------------
 # Posbiraj VSECHNY procesy ve stromu (parent + descendants).
-# SGLang TP>1 forkuje workery — bez kill -children drzi GPU pamet po smrti
+# SGLang TP>1 forkuje workery - bez kill -children drzi GPU pamet po smrti
 # parent procesu (OOM pri swapu Qwen<->Gemma mezi fazama).
 # ---------------------------------------------------------------------------
 function Get-Descendants {
@@ -40,10 +40,10 @@ function Get-Descendants {
 $descendants = @(Get-Descendants -ParentId $llmPid)
 $allPids = @($llmPid) + $descendants
 
-Write-Log "Zastavuji SGLang (PID $llmPid) na portu $Port — graceful stop celeho stromu..."
+Write-Log "Zastavuji SGLang (PID $llmPid) na portu $Port - graceful stop celeho stromu..."
 Write-Log "  Strom procesu: $($allPids -join ' ')"
 
-# SIGTERM ekvivalent (Stop-Process bez -Force) — children PRVNI
+# SIGTERM ekvivalent (Stop-Process bez -Force) - children PRVNI
 foreach ($p in $descendants) {
     Stop-Process -Id $p -ErrorAction SilentlyContinue
 }

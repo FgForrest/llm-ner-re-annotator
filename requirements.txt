@@ -5,6 +5,10 @@ pydantic==2.10.4
 # přeskočí (best-effort) a zůstanou LLM lemmata. Model (~STANZA_LANG, default
 # cs) se při prvním použití stáhne automaticky do ~/stanza_resources.
 stanza==1.11.1
+# Embeddingy ve fázi taxonomie (labeler/taxonomy_embeddings.py): ruler
+# disjointness auditu (TAXONOMY_AUDIT_RULER=auto) + fáze 0b analýza taxonomie.
+# Běží automaticky ve smoke testu i v produkci. torch je už závislost stanzy.
+sentence-transformers==3.3.1
 # RDF/OWL output (jen pro smoke-test --phase finalize, nepoužívá se v produkční pipeline)
 rdflib==7.1.1
 # Volitelné: HTML dokumentace pro vygenerovaný .owl (pip install pylode); pokud

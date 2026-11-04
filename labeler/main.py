@@ -151,8 +151,22 @@ def build_parser() -> argparse.ArgumentParser:
             "--samples-per-dataset", type=int,
             default=CONFIG.taxonomy_samples_per_dataset, metavar="N",
             help="Počet ukázek per dataset pro auto taxonomy discovery "
-                 "(default z TAXONOMY_SAMPLES_PER_DATASET, jinak 10).",
+                 "(fallback náhodného výběru, když chybí taxonomy_sampling.json z fáze 0a; "
+                 "default z TAXONOMY_SAMPLES_PER_DATASET, u auto 10).",
         )
+
+    # taxonomy-sample — fáze 0a (výběr vzorků přes embeddingy na vLLM)
+    psm = sub.add_parser(
+        "taxonomy-sample",
+        help="Fáze 0a — vybere ukázky pro návrh taxonomie přes embeddingy "
+             "(BAAI/bge-m3 na vLLM embedding serveru, EMBEDDING_BASE_URL). "
+             "Počet: TAXONOMY_SAMPLES_PER_DATASET=auto|číslo. Výstup: "
+             "taxonomy_sampling.json v checkpointech.",
+    )
+    psm.add_argument(
+        "--data-dir", type=Path, default=None, metavar="DIR",
+        help=f"Složka se vstupními JSON soubory (výchozí: DATA_DIR, tj. {CONFIG.data_dir})",
+    )
 
     # taxonomy — samostatná fáze 0
     ptx = sub.add_parser(
@@ -172,7 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--samples-per-dataset", type=int,
         default=CONFIG.taxonomy_samples_per_dataset,
         help="Počet ukázek per dataset pro auto mode "
-             "(default z TAXONOMY_SAMPLES_PER_DATASET, jinak 10).",
+             "(fallback náhodného výběru, když chybí taxonomy_sampling.json z fáze 0a; "
+                 "default z TAXONOMY_SAMPLES_PER_DATASET, u auto 10).",
     )
 
     # extract
@@ -305,6 +320,65 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_normalize_flags(pf)
 
+    # taxonomy-embeddings — fáze 0b (volitelná embedding analýza taxonomie)
+    pemb = sub.add_parser(
+        "taxonomy-embeddings",
+        help="Fáze 0b (volitelná) — embedding analýza sémantické disjunktnosti "
+             "tříd taxonomie (heuristika, NE formální OWL důkaz). Výstup: "
+             "taxonomy_embedding_report.{json,md} + taxonomy_embeddings.json. "
+             "Automaticky běží i při tvorbě taxonomie (TAXONOMY_EMBEDDING_ENABLED).",
+    )
+    pemb.add_argument(
+        "--taxonomy", type=Path, default=None, metavar="FILE",
+        help="Cesta k entity_taxonomy.json (default: checkpoints/entity_taxonomy.json).",
+    )
+    pemb.add_argument(
+        "--output-dir", type=Path, default=None, metavar="DIR",
+        help=f"Kam zapsat reporty (default: CHECKPOINT_DIR, tj. {CONFIG.checkpoint_dir}).",
+    )
+    pemb.add_argument("--model", default=None,
+                      help="Embedding model (default z TAXONOMY_EMBEDDING_MODEL).")
+    pemb.add_argument("--device", default=None,
+                      help="Zařízení: auto/cpu/cuda (default z TAXONOMY_EMBEDDING_DEVICE).")
+    pemb.add_argument("--batch-size", type=int, default=None,
+                      help="Batch size embeddingu (default z TAXONOMY_EMBEDDING_BATCH_SIZE).")
+    pemb.add_argument(
+        "--threshold-mode", choices=["relative", "absolute"], default=None,
+        help="relative (DEFAULT) — prahy v z-skóre nad distribucí podobností "
+             "dané taxonomie (univerzální napříč modely); absolute — pevné "
+             "prahy kosinové podobnosti (legacy).",
+    )
+    pemb.add_argument(
+        "--center", action=argparse.BooleanOptionalAction, default=None,
+        help="Mean-centering embeddingů — odstraní anizotropii (default ON). "
+             "Bez něj se podobnosti tísní ve vysokém pásmu.",
+    )
+    pemb.add_argument("--duplicate-z", type=float, default=None,
+                      help="Práh possible_duplicate v z-skóre (default 2.5).")
+    pemb.add_argument("--overlap-z", type=float, default=None,
+                      help="Práh possible_overlap v z-skóre (default 1.0).")
+    pemb.add_argument("--disjoint-z", type=float, default=None,
+                      help="Práh disjoint_candidate v z-skóre (default -0.5).")
+    pemb.add_argument("--duplicate-threshold", type=float, default=None,
+                      help="Absolutní práh possible_duplicate (default 0.90; "
+                           "jen pro --threshold-mode absolute).")
+    pemb.add_argument("--overlap-threshold", type=float, default=None,
+                      help="Absolutní práh possible_overlap (default 0.72; "
+                           "jen pro --threshold-mode absolute).")
+    pemb.add_argument("--disjoint-threshold", type=float, default=None,
+                      help="Absolutní práh disjoint_candidate (default 0.30; "
+                           "jen pro --threshold-mode absolute).")
+    pemb.add_argument("--cluster-distance-threshold", type=float, default=None,
+                      help="Práh aglomerativního clusteringu (default 0.35).")
+    pemb.add_argument(
+        "--write-vectors", action=argparse.BooleanOptionalAction, default=None,
+        help="Zapsat embedding vektory do taxonomy_embeddings.json "
+             "(default z TAXONOMY_EMBEDDING_WRITE_VECTORS; bez vektorů "
+             "nefunguje cache napříč běhy, reporty fungují vždy).",
+    )
+    pemb.add_argument("--seed", type=int, default=None,
+                      help="Seed (default z TAXONOMY_EMBEDDING_SEED).")
+
     # pipeline (vše najednou — fáze 0(volitelně) → 4 fáze sekvenčně)
     pp = sub.add_parser(
         "pipeline",
@@ -315,6 +389,12 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument(
         "--keep-intermediate", action="store_true",
         help="Viz finalize --keep-intermediate",
+    )
+    pp.add_argument(
+        "--analyze-taxonomy-embeddings", action="store_true",
+        help="Po fázi 0 spustit i embedding analýzu taxonomie (fáze 0b) — "
+             "BEST-EFFORT: selhání zaloguje warning a pipeline pokračuje. "
+             "Lze zapnout i přes TAXONOMY_EMBEDDING_ENABLED=true v .env.",
     )
     add_synthetic_flags(pp)
     add_taxonomy_flags(pp)
@@ -329,7 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ps.add_argument(
         "--phase",
-        choices=["taxonomy", "extract", "critic", "revise", "finalize", "report"],
+        choices=["sample", "taxonomy", "extract", "critic", "revise", "finalize", "report"],
         required=True,
         help="Která fáze se má teď změřit. Spouští se sekvenčně mezi tím, jak "
              "uživatel přepíná docker-compose profily. 'taxonomy' (fáze 0) "
@@ -513,6 +593,25 @@ async def _run_smoke_test(args: argparse.Namespace) -> int:
     # odpovídá reálnému produkčnímu běhu — měříme přesně to, co poběží ostře.
     # Pozn.: smoke `--samples-per-dataset` (default 100) se týká vzorku pro
     # extract/critic; auto-discovery používá vlastní count (CONFIG, default 10).
+    # Fáze 0a (výběr vzorků přes embeddingy) — stejně jako fáze 0 jednorázová
+    # konstanta (kóduje se max. TAXONOMY_SAMPLE_POOL_MAX textů per doména).
+    if phase == "sample":
+        object.__setattr__(CONFIG, "data_dir", data_dir)
+        from .taxonomy_sampling import run_taxonomy_sampling
+        t0 = _time.perf_counter()
+        try:
+            path = run_taxonomy_sampling()
+        except Exception as e:  # noqa: BLE001 — skript rozhodne (best-effort)
+            logger.error(f"[smoke-test] sample (fáze 0a) selhala: {type(e).__name__}: {e}")
+            return 1
+        wall = _time.perf_counter() - t0
+        st.record_phase_timing(
+            "sample", items_processed=0, input_chars=0, output_chars=0,
+            wall_clock_s=wall,
+        )
+        print(f"\n[smoke-test] sample (fáze 0a) dokončena: {wall:.1f}s → {path}")
+        return 0
+
     if phase == "taxonomy":
         object.__setattr__(CONFIG, "data_dir", data_dir)
         tax_samples = CONFIG.taxonomy_samples_per_dataset
@@ -575,6 +674,7 @@ async def _run_smoke_test(args: argparse.Namespace) -> int:
         t0 = _time.perf_counter()
         await run_critic(
             dry_run_limit=None, skip_synthetic=False, only_synthetic=False,
+            taxonomy=load_taxonomy_if_exists(),
         )
         wall = _time.perf_counter() - t0
         nonok = _count_critic_nonok()
@@ -599,6 +699,7 @@ async def _run_smoke_test(args: argparse.Namespace) -> int:
         t0 = _time.perf_counter()
         await run_revise(
             dry_run_limit=None, skip_synthetic=False, only_synthetic=False,
+            taxonomy=load_taxonomy_if_exists(),
         )
         wall = _time.perf_counter() - t0
         st.record_phase_timing(
@@ -711,6 +812,90 @@ async def _maybe_run_taxonomy(args: argparse.Namespace, data_dir: Path) -> None:
     )
 
 
+def _build_embedding_config(args: argparse.Namespace):
+    """Sestaví TaxonomyEmbeddingConfig: env defaulty (CONFIG) + CLI overrides
+    (CLI má přednost). Validace prahů proběhne při konstrukci — tj. PŘED
+    načtením embedding modelu."""
+    from .taxonomy_embeddings import TaxonomyEmbeddingConfig
+    base = TaxonomyEmbeddingConfig.from_env().model_dump()
+    overrides = {
+        "model": getattr(args, "model", None),
+        "device": getattr(args, "device", None),
+        "batch_size": getattr(args, "batch_size", None),
+        "threshold_mode": getattr(args, "threshold_mode", None),
+        "center": getattr(args, "center", None),
+        "duplicate_z": getattr(args, "duplicate_z", None),
+        "overlap_z": getattr(args, "overlap_z", None),
+        "disjoint_z": getattr(args, "disjoint_z", None),
+        "duplicate_threshold": getattr(args, "duplicate_threshold", None),
+        "overlap_threshold": getattr(args, "overlap_threshold", None),
+        "disjoint_threshold": getattr(args, "disjoint_threshold", None),
+        "cluster_distance_threshold": getattr(
+            args, "cluster_distance_threshold", None
+        ),
+        "write_vectors": getattr(args, "write_vectors", None),
+        "seed": getattr(args, "seed", None),
+    }
+    base.update({k: v for k, v in overrides.items() if v is not None})
+    return TaxonomyEmbeddingConfig(**base)
+
+
+def _run_taxonomy_embeddings_cmd(args: argparse.Namespace) -> int:
+    """Samostatný příkaz `taxonomy-embeddings`: nenulový exit code při chybě
+    (na rozdíl od best-effort integrace v pipeline)."""
+    from pydantic import ValidationError as _ValidationError
+    from .taxonomy import taxonomy_path as _default_taxonomy_path
+    from .taxonomy_embeddings import (
+        REPORT_JSON_FILE, REPORT_MD_FILE, EMBEDDINGS_FILE,
+        TaxonomyEmbeddingError, run_taxonomy_embedding_analysis,
+    )
+    try:
+        config = _build_embedding_config(args)
+    except _ValidationError as e:
+        print(f"Neplatná konfigurace embedding analýzy:\n{e}", file=sys.stderr)
+        return 2
+    tax_path = args.taxonomy or _default_taxonomy_path()
+    out_dir = args.output_dir or CONFIG.checkpoint_dir
+    try:
+        run_taxonomy_embedding_analysis(tax_path, out_dir, config)
+    except TaxonomyEmbeddingError as e:
+        print(f"Embedding analýza selhala: {e}", file=sys.stderr)
+        return 1
+    print(f"Report (JSON):      {out_dir / REPORT_JSON_FILE}")
+    print(f"Report (Markdown):  {out_dir / REPORT_MD_FILE}")
+    print(f"Embeddings/cache:   {out_dir / EMBEDDINGS_FILE}")
+    return 0
+
+
+def _maybe_run_taxonomy_embeddings_best_effort(args: argparse.Namespace) -> None:
+    """Pipeline integrace (fáze 0b) — BEST-EFFORT: jakékoliv selhání zaloguje
+    warning a pipeline POKRAČUJE (na rozdíl od samostatného příkazu). Běží jen
+    když je zapnuto přes --analyze-taxonomy-embeddings nebo
+    TAXONOMY_EMBEDDING_ENABLED=true."""
+    # Se zapnutým TAXONOMY_EMBEDDING_ENABLED (default) proběhla analýza už
+    # automaticky uvnitř run_taxonomy_discovery → tady jen ruční zapnutí
+    # flagem, když je v env vypnutá.
+    if CONFIG.taxonomy_embedding_enabled:
+        return
+    if not getattr(args, "analyze_taxonomy_embeddings", False):
+        return
+    logging.getLogger(__name__).info(
+        "Pipeline: spouštím fázi 0b (taxonomy embedding analýza, best-effort)"
+    )
+    from .taxonomy import taxonomy_path as _default_taxonomy_path
+    try:
+        from .taxonomy_embeddings import run_taxonomy_embedding_analysis
+        config = _build_embedding_config(args)
+        run_taxonomy_embedding_analysis(
+            _default_taxonomy_path(), CONFIG.checkpoint_dir, config,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort fáze, pipeline jede dál
+        logging.getLogger(__name__).warning(
+            f"Taxonomy embedding analýza selhala ({type(e).__name__}: {e}) — "
+            f"pipeline pokračuje bez ní (best-effort fáze 0b)."
+        )
+
+
 async def _run(args: argparse.Namespace) -> int:
     CONFIG.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -743,12 +928,14 @@ async def _run(args: argparse.Namespace) -> int:
             dry_run_limit=args.limit,
             skip_synthetic=args.skip_synthetic,
             only_synthetic=args.only_synthetic,
+            taxonomy=load_taxonomy_if_exists(),
         )
     elif args.cmd == "revise":
         await run_revise(
             dry_run_limit=args.limit,
             skip_synthetic=args.skip_synthetic,
             only_synthetic=args.only_synthetic,
+            taxonomy=load_taxonomy_if_exists(),
         )
     elif args.cmd == "finalize":
         opts = _build_normalize_opts(args)  # default-ON cleaning
@@ -763,11 +950,26 @@ async def _run(args: argparse.Namespace) -> int:
         )
     elif args.cmd == "smoke-test":
         return await _run_smoke_test(args)
+    elif args.cmd == "taxonomy-sample":
+        object.__setattr__(CONFIG, "data_dir", _resolve_data_dir(args))
+        from .taxonomy_sampling import run_taxonomy_sampling
+        try:
+            path = run_taxonomy_sampling()
+        except Exception as e:  # noqa: BLE001 — nenulový exit, skript rozhodne
+            logging.getLogger(__name__).error(
+                f"taxonomy-sample selhal: {type(e).__name__}: {e}"
+            )
+            return 1
+        print(f"Taxonomy sampling saved: {path}")
+    elif args.cmd == "taxonomy-embeddings":
+        return _run_taxonomy_embeddings_cmd(args)
     elif args.cmd == "pipeline":
         data_dir = _resolve_data_dir(args)
         data_dir.mkdir(parents=True, exist_ok=True)
         # Fáze 0 (taxonomy discovery) — default auto, běží i v produkci.
         await _maybe_run_taxonomy(args, data_dir)
+        # Fáze 0b (volitelná, best-effort) — embedding analýza taxonomie.
+        _maybe_run_taxonomy_embeddings_best_effort(args)
         items = _collect_items(data_dir, getattr(args, "domain", None), args.limit)
         await run_extraction(
             items,
@@ -780,11 +982,13 @@ async def _run(args: argparse.Namespace) -> int:
             dry_run_limit=args.limit,
             skip_synthetic=args.skip_synthetic,
             only_synthetic=args.only_synthetic,
+            taxonomy=load_taxonomy_if_exists(),
         )
         await run_revise(
             dry_run_limit=args.limit,
             skip_synthetic=args.skip_synthetic,
             only_synthetic=args.only_synthetic,
+            taxonomy=load_taxonomy_if_exists(),
         )
         opts = _build_normalize_opts(args)  # default-ON cleaning
         # Pipeline (produkční): final_labels.{jsonl,json} + normalization_report.json.

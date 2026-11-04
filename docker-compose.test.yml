@@ -62,6 +62,7 @@ services:
 
   labeler-extract-sglang:
     profiles: ["test-extract"]
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build:
       context: .
       dockerfile: Dockerfile.labeler
@@ -75,10 +76,12 @@ services:
       - EXTRACTOR_REASONING=false
       - EXTRACTOR_MAX_TOKENS=2048
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
       - CHECKPOINT_DIR=/app/checkpoints
     volumes:
       - ${DATA_DIR:-./data}:/app/data:ro
       - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+      - ${MODEL_CACHE_DIR:-./models}:/models
     command: >
       extract
       --limit 3
@@ -139,6 +142,7 @@ services:
 
   labeler-critic-sglang:
     profiles: ["test-critic"]
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build:
       context: .
       dockerfile: Dockerfile.labeler
@@ -152,10 +156,12 @@ services:
       - CRITIC_REASONING=false
       - CRITIC_MAX_TOKENS=2048
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
       - CHECKPOINT_DIR=/app/checkpoints
     volumes:
       - ${DATA_DIR:-./data}:/app/data:ro
       - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+      - ${MODEL_CACHE_DIR:-./models}:/models
     # Critic běží sám (Gemma) — revisor (Qwen) přijde v samostatné fázi 2b
     # přes profil test-revise. Tím modely nikdy neběží na GPU souběžně.
     command: ["critic"]
@@ -165,6 +171,7 @@ services:
   # critic_results a doplní extractor_revised pro non-ok záznamy.
   labeler-revise-sglang:
     profiles: ["test-revise"]
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build:
       context: .
       dockerfile: Dockerfile.labeler
@@ -180,9 +187,11 @@ services:
       - EXTRACTOR_REASONING=false
       - EXTRACTOR_MAX_TOKENS=2048
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
       - CHECKPOINT_DIR=/app/checkpoints
     volumes:
       - ${DATA_DIR:-./data}:/app/data:ro
       - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+      - ${MODEL_CACHE_DIR:-./models}:/models
     command: ["revise"]
     restart: "no"

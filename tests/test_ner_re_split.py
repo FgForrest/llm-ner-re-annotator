@@ -91,9 +91,9 @@ def test_assemble_relation_field_aliases():
 
 def test_assemble_fills_missing_lemma_from_text():
     g = assemble_graph(
-        [{"id": "e1", "text": "Foto Laccer", "category": "ORGANIZACE"}], []
+        [{"id": "e1", "text": "Foto ACME", "category": "ORGANIZACE"}], []
     )
-    assert g.entities[0].lemma == "Foto Laccer"
+    assert g.entities[0].lemma == "Foto ACME"
 
 
 def test_assemble_never_raises_on_garbage():

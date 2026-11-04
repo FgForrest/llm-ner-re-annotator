@@ -161,14 +161,14 @@ _MAX_WORDS_KEYPHRASE: int = 25
 # ---------------------------------------------------------------------------
 
 # URL: http(s)://... nebo www.xxx nebo domain s explicitní path/query.
-# CO ZÁMĚRNĚ NEMATCHUJE: holé brand-style domény typu "Mall.cz", "iDnes.cz",
-# "Alza.cz" — to jsou platné ORGANIZACE/PRODUKT entity, ne URL. Detekce
+# CO ZÁMĚRNĚ NEMATCHUJE: holé brand-style domény typu "AcmeShop.cz", "DemoZpravy.cz",
+# "VzorObchod.cz" — to jsou platné ORGANIZACE/PRODUKT entity, ne URL. Detekce
 # bare-domain by je zbytečně dropla z NER datasetu.
 #
 # Pravidla:
 #   - http(s):// nebo ftp:// nebo www.X  → vždy URL
 #   - bare domain S explicitní cestou (`/`, `?`, `#`) → URL (např. example.cz/blog)
-#   - bare domain BEZ cesty (Mall.cz) → NENÍ URL (necháme jako entitu)
+#   - bare domain BEZ cesty (AcmeShop.cz) → NENÍ URL (necháme jako entitu)
 _URL_RE = re.compile(
     r"(?:(?:https?|ftp)://|www\.)[^\s<>()]+|"
     r"\b[a-zA-Z0-9][-a-zA-Z0-9_.]*"

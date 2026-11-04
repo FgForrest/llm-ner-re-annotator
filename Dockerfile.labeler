@@ -7,7 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Stanza (lemmatizace) i sentence-transformers (embeddingy ve fázi taxonomie)
+# závisí na torch — instalujeme CPU-only wheel (~200 MB) místo defaultního CUDA
+# buildu z PyPI (GB+ s nvidia balíky). Labeler GPU nepotřebuje: LLM inference
+# běží na serverech, lemmatizace i malý embedding model jedou na CPU.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY labeler/ /app/labeler/
 
@@ -15,7 +20,11 @@ COPY labeler/ /app/labeler/
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DATA_DIR=/app/data \
-    CHECKPOINT_DIR=/app/checkpoints
+    CHECKPOINT_DIR=/app/checkpoints \
+    HF_HOME=/models
+
+# /models = sdílená HF cache (docker-compose mountuje MODEL_CACHE_DIR) — embedding
+# model fáze taxonomie (sentence-transformers) se stáhne jednou, ne při každém běhu.
 
 # Mount pointy
 VOLUME ["/app/data", "/app/checkpoints"]

@@ -1,4 +1,4 @@
-# Auto-install SGLang pro native mode pipeline (Windows / PowerShell).
+﻿# Auto-install SGLang pro native mode pipeline (Windows / PowerShell).
 #
 # Co dela:
 #   1. Verifikuje CUDA 13+ (NVFP4 na B200 to vyzaduje)
@@ -39,7 +39,7 @@ function Write-Warn { param($m) Write-Host "`n!! $m" -ForegroundColor Yellow }
 # ---------------------------------------------------------------------------
 function Test-Cuda {
     if ($SkipCudaCheck -or $env:SKIP_CUDA_CHECK -eq "1") {
-        Write-Warn "SkipCudaCheck=true — preskakuji CUDA verifikaci."
+        Write-Warn "SkipCudaCheck=true - preskakuji CUDA verifikaci."
         return
     }
     if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
@@ -55,7 +55,7 @@ function Test-Cuda {
     $major = [int]$match.Groups[1].Value
     $minor = [int]$match.Groups[2].Value
     if ($major -lt 13) {
-        Write-Err "CUDA $major.$minor detekovano — pipeline vyzaduje CUDA 13+ pro NVFP4."
+        Write-Err "CUDA $major.$minor detekovano - pipeline vyzaduje CUDA 13+ pro NVFP4."
         throw "CUDA <13"
     }
     Write-Log "CUDA $major.$minor detekovano +"
@@ -84,7 +84,7 @@ function Test-PythonVersion {
     $major = [int]$parts[0]
     $minor = [int]$parts[1]
     if ($major -ne 3 -or $minor -lt 10 -or $minor -gt 12) {
-        Write-Warn "Python $ver — SGLang typicky podporuje 3.10-3.12. Muzou byt compat issues."
+        Write-Warn "Python $ver - SGLang typicky podporuje 3.10-3.12. Muzou byt compat issues."
     }
 }
 
@@ -134,7 +134,7 @@ function Install-SgLang {
 function Install-FlashInfer {
     param([string]$Py)
     if ($SkipFlashinfer) {
-        Write-Warn "SkipFlashinfer=true — flashinfer-python nenainstalovan."
+        Write-Warn "SkipFlashinfer=true - flashinfer-python nenainstalovan."
         Write-Warn "NVFP4 MoE (Qwen3.5-122B-A10B) bez flashinfer NEPOJEDE."
         return
     }
@@ -173,7 +173,7 @@ function Test-Install {
         & $Py -c "import labeler" 2>$null
         Write-Host "  labeler module +"
     } catch {
-        Write-Warn "labeler module nelze importovat — jsi v root adresari projektu?"
+        Write-Warn "labeler module nelze importovat - jsi v root adresari projektu?"
     }
 }
 

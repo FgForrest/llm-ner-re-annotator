@@ -34,6 +34,7 @@ services:
   # scripts/ se mountuje (Dockerfile.labeler je nekopíruje).
   labeler-tune-sglang:
     profiles: ["extract-sglang"]
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     depends_on:
       extractor-sglang: { condition: service_healthy }
@@ -59,6 +60,7 @@ services:
   # Python probe pro CRITIC roli (cílí na critic endpoint, --role critic).
   labeler-tune-critic:
     profiles: ["critic-sglang"]
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     depends_on:
       critic-sglang: { condition: service_healthy }

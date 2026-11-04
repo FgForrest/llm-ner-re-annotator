@@ -40,6 +40,16 @@ SGLANG_CONTEXT_LEN="${SGLANG_CONTEXT_LEN:-65536}"
 SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:-}"
 SGLANG_LOG_DIR="${SGLANG_LOG_DIR:-/tmp}"
 SGLANG_READY_TIMEOUT_S="${SGLANG_READY_TIMEOUT_S:-1200}"
+# NATIVE_ENGINE: sglang (default, všechny LLM fáze) | vllm (JEN embedding
+# server fáze 0a — bge-m3). U vllm se extra args předávají pozičně ("$@"),
+# SGLANG_MEM_FRACTION_STATIC → --gpu-memory-utilization. VLLM_BIN = cesta
+# k `vllm` (např. z vlastního venv, ať se torch nepere se SGLang).
+NATIVE_ENGINE="${NATIVE_ENGINE:-sglang}"
+VLLM_BIN="${VLLM_BIN:-vllm}"
+case "$NATIVE_ENGINE" in
+    vllm) ENGINE_LABEL="vLLM" ;;
+    *)    ENGINE_LABEL="SGLang" ;;
+esac
 
 PID_FILE="${SGLANG_LOG_DIR}/sglang_${PORT}.pid"
 LOG_FILE="${SGLANG_LOG_DIR}/sglang_${PORT}.log"
@@ -117,7 +127,7 @@ case " $SGLANG_FINAL_EXTRA " in
     *) SGLANG_FINAL_EXTRA="--context-length=$SGLANG_CONTEXT_LEN $SGLANG_FINAL_EXTRA" ;;
 esac
 
-log "Spouštím SGLang server na portu $PORT"
+log "Spouštím $ENGINE_LABEL server na portu $PORT"
 echo "  model:               $MODEL_PATH"
 echo "  tp_size:             $TP_SIZE"
 echo "  mem_fraction_static: $SGLANG_MEM_FRACTION_STATIC"
@@ -127,19 +137,29 @@ echo "  log file:            $LOG_FILE"
 # Background launch — nohup pro detach od terminálu.
 # `--max-running-requests` a `--context-length` jsou součástí
 # SGLANG_FINAL_EXTRA výše (caller-supplied OR env-var default).
-nohup python -m sglang.launch_server \
-    --model-path "$MODEL_PATH" \
-    --host 0.0.0.0 \
-    --port "$PORT" \
-    --tp "$TP_SIZE" \
-    --mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC" \
-    --trust-remote-code \
-    $SGLANG_FINAL_EXTRA "$@" \
-    > "$LOG_FILE" 2>&1 &
+if [ "$NATIVE_ENGINE" = "vllm" ]; then
+    nohup "$VLLM_BIN" serve "$MODEL_PATH" \
+        --host 0.0.0.0 \
+        --port "$PORT" \
+        --tensor-parallel-size "$TP_SIZE" \
+        --gpu-memory-utilization "$SGLANG_MEM_FRACTION_STATIC" \
+        "$@" \
+        > "$LOG_FILE" 2>&1 &
+else
+    nohup python -m sglang.launch_server \
+        --model-path "$MODEL_PATH" \
+        --host 0.0.0.0 \
+        --port "$PORT" \
+        --tp "$TP_SIZE" \
+        --mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC" \
+        --trust-remote-code \
+        $SGLANG_FINAL_EXTRA "$@" \
+        > "$LOG_FILE" 2>&1 &
+fi
 
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PID_FILE"
-log "SGLang server PID: $SERVER_PID (zalogováno do $PID_FILE)"
+log "$ENGINE_LABEL server PID: $SERVER_PID (zalogováno do $PID_FILE)"
 
 # ---------------------------------------------------------------------------
 # Wait for ready — poll /v1/models každou sekundu.
@@ -159,7 +179,7 @@ last_tick=0
 while true; do
     # Spadl proces?
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        err "SGLang proces (PID $SERVER_PID) skončil. Posledních 50 řádků logu:"
+        err "$ENGINE_LABEL proces (PID $SERVER_PID) skončil. Posledních 50 řádků logu:"
         tail -n 50 "$LOG_FILE" >&2
         rm -f "$PID_FILE"
         exit 1
@@ -168,7 +188,7 @@ while true; do
     if command -v curl >/dev/null 2>&1; then
         if curl -fs --max-time 3 "http://localhost:${PORT}/v1/models" >/dev/null 2>&1; then
             elapsed=$(( $(date +%s) - start_ts ))
-            log "✅ SGLang ready (po ${elapsed}s) na http://localhost:${PORT}/v1"
+            log "✅ $ENGINE_LABEL ready (po ${elapsed}s) na http://localhost:${PORT}/v1"
             exit 0
         fi
     fi
@@ -183,7 +203,7 @@ while true; do
     stalled=$(( now - last_progress_ts ))
     if [ "$stalled" -gt "$SGLANG_READY_TIMEOUT_S" ]; then
         elapsed=$(( now - start_ts ))
-        err "Žádný progress ${stalled}s (celkem ${elapsed}s) — SGLang visí, ne stahuje. Kill."
+        err "Žádný progress ${stalled}s (celkem ${elapsed}s) — $ENGINE_LABEL visí, ne stahuje. Kill."
         err "Posledních 50 řádků logu:"
         tail -n 50 "$LOG_FILE" >&2
         kill "$SERVER_PID" 2>/dev/null || true

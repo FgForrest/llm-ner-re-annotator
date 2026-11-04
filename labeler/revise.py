@@ -43,9 +43,13 @@ async def _revise_one(
     *,
     max_tokens: int,
     reasoning: bool,
+    taxonomy=None,
 ) -> Optional[CriticResult]:
     """
     Pro jeden CriticResult zavolá revisora a doplní extractor_revised.
+
+    `taxonomy` (fáze 0) = povolený slovník kategorií; bez něj revisor neví,
+    co je platný label, a potvrdil by i chybnou "opravu" od critica.
 
     Vrací nový CriticResult (s vyplněnými extractor_revised polí), nebo None
     pokud revisor selhal nebo vrátil nevalidní graf — v takovém případě se
@@ -57,7 +61,7 @@ async def _revise_one(
 
         return await revise_split(
             revisor_client, extraction, critic_result,
-            max_tokens=max_tokens, reasoning=reasoning,
+            max_tokens=max_tokens, reasoning=reasoning, taxonomy=taxonomy,
         )
 
     original_graph_dict = extraction.graph.model_dump(
@@ -75,6 +79,7 @@ async def _revise_one(
         critic_status=critic_result.status,
         critic_reasoning=critic_result.reasoning,
         corrected_graph=corrected_dict,
+        taxonomy=taxonomy,
     )
 
     try:
@@ -128,6 +133,7 @@ async def _revise_branch(
     is_synth: bool,
     revisor_client: LLMClient,
     dry_run_limit: Optional[int],
+    taxonomy=None,
 ) -> None:
     """Zpracuje jednu větev (REAL nebo SYNTH)."""
     crit_p = critic_path(synthetic=is_synth)
@@ -215,6 +221,7 @@ async def _revise_branch(
                     cr,
                     max_tokens=CONFIG.revisor_max_tokens,
                     reasoning=CONFIG.revisor_reasoning,
+                    taxonomy=taxonomy,
                 )
                 if updated is None:
                     tracker.tick(error=True)
@@ -246,6 +253,7 @@ async def run_revise(
     dry_run_limit: Optional[int] = None,
     skip_synthetic: bool = False,
     only_synthetic: bool = False,
+    taxonomy=None,
 ) -> None:
     """
     Hlavní loop fáze 2b — standalone revisor.
@@ -273,6 +281,7 @@ async def run_revise(
         max_concurrency=CONFIG.revisor_concurrency,
         request_timeout=CONFIG.request_timeout_s,
         max_retries=CONFIG.max_retries,
+        context_len=CONFIG.extractor_context_len,
     ) as revisor_client:
         await revisor_client.wait_ready(max_wait_s=1200)
 
@@ -282,4 +291,5 @@ async def run_revise(
                 is_synth=is_synth,
                 revisor_client=revisor_client,
                 dry_run_limit=dry_run_limit,
+                taxonomy=taxonomy,
             )

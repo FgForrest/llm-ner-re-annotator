@@ -38,7 +38,7 @@ from labeler.taxonomy import (
     _extract_json_list,
     _heldout_snippets,
     _MANDATORY_LABELS,
-    _MIN_LLM_LABELS,
+    min_llm_labels,
     _parse_llm_taxonomy_response,
     _select_confusable_pairs,
     audit_and_refine_taxonomy,
@@ -331,9 +331,9 @@ def test_ensure_mandatory_labels_none_missing():
 def test_assess_quality_ok_when_enough_labels():
     tax = Taxonomy(labels=[
         TaxonomyLabel(code=f"LABEL_{i}", description=f"Popis labelu číslo {i}.")
-        for i in range(_MIN_LLM_LABELS)
+        for i in range(min_llm_labels())
     ])
-    assert _assess_taxonomy_quality(tax, n_llm_labels=_MIN_LLM_LABELS) == []
+    assert _assess_taxonomy_quality(tax, n_llm_labels=min_llm_labels()) == []
 
 
 def test_assess_quality_complains_too_few_llm_labels():
@@ -343,7 +343,7 @@ def test_assess_quality_complains_too_few_llm_labels():
     ])
     complaints = _assess_taxonomy_quality(tax, n_llm_labels=1)
     assert complaints  # neprázdné
-    assert any("málo" in c.lower() or str(_MIN_LLM_LABELS) in c for c in complaints)
+    assert any("málo" in c.lower() or str(min_llm_labels()) in c for c in complaints)
 
 
 def test_assess_quality_complains_invalid_labels():
@@ -351,9 +351,9 @@ def test_assess_quality_complains_invalid_labels():
         TaxonomyLabel(code="dobry_kod_ale_lowercase", description="Dost dlouhý popis."),
     ] + [
         TaxonomyLabel(code=f"LABEL_{i}", description=f"Popis labelu číslo {i}.")
-        for i in range(_MIN_LLM_LABELS)
+        for i in range(min_llm_labels())
     ])
-    complaints = _assess_taxonomy_quality(tax, n_llm_labels=_MIN_LLM_LABELS + 1)
+    complaints = _assess_taxonomy_quality(tax, n_llm_labels=min_llm_labels() + 1)
     assert any("UPPERCASE_SNAKE" in c or "validní" in c.lower() for c in complaints)
 
 
@@ -372,7 +372,7 @@ class _FakeResp:
 def _good_labels_payload():
     return {"labels": [
         {"code": f"LABEL_{i}", "description": f"Popis labelu číslo {i}."}
-        for i in range(_MIN_LLM_LABELS)
+        for i in range(min_llm_labels())
     ]}
 
 
@@ -1010,6 +1010,9 @@ def _run_audit_with_fake(client, tax, **kw):
         for i in range(30)
     ]
     try:
+        # LLM ruler explicitně: s nainstalovaným sentence-transformers by
+        # default 'auto' sáhl na embeddingy a fake LLM probe by se nevolal.
+        kw.setdefault("ruler", "llm")
         return asyncio.run(audit_and_refine_taxonomy(client=client, tax=tax, **kw))
     finally:
         tax_mod.scan_data_dir = orig_scan
@@ -1051,7 +1054,7 @@ def test_audit_noop_on_empty_data(monkeypatch=None):
     client = _AuditFakeClient(probe_confidences=[0.5])
     tax = _tax_two_confusable()
     try:
-        out = asyncio.run(audit_and_refine_taxonomy(client=client, tax=tax))
+        out = asyncio.run(audit_and_refine_taxonomy(client=client, tax=tax, ruler="llm"))
     finally:
         tax_mod.scan_data_dir = orig_scan
     assert client.calls == 0  # žádné LLM volání

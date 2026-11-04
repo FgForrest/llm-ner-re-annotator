@@ -20,7 +20,9 @@ from pathlib import Path
 # This ensures native runs (without docker compose) still respect .env
 _env_path = Path(".env")
 if _env_path.exists():
-    with open(_env_path, "r", encoding="utf-8") as f:
+    # utf-8-sig: toleruje BOM na začátku .env (soubory uložené z Windows
+    # editorů ho mívají) — s čistým utf-8 by BOM přilnul k prvnímu klíči.
+    with open(_env_path, "r", encoding="utf-8-sig") as f:
         for _line in f:
             _line = _line.strip()
             if not _line or _line.startswith("#"):
@@ -71,6 +73,12 @@ class Config:
     revisor_reasoning: bool = _getenv_bool(
         "REVISOR_REASONING", _getenv_bool("EXTRACTOR_REASONING", False)
     )
+    # Fáze 0 (taxonomy discovery + disjointness audit): thinking mode pro
+    # návrh taxonomie, konfuzní probe i zostřování hranic. Default ON —
+    # fáze 0 je pár jednorázových volání na celý korpus a kvalita návrhu
+    # taxonomie ovlivňuje VŠECHNO za ní; extra thinking tokeny tu stojí za to.
+    # Pokud backend/model thinking nepodporuje, vypni TAXONOMY_REASONING=false.
+    taxonomy_reasoning: bool = _getenv_bool("TAXONOMY_REASONING", True)
 
     # Concurrency = počet HTTP requestů, které labeler pošle paralelně na endpoint.
     # Defaulty jsou laděné na produkční backend (sglang / vLLM s velkou batch
@@ -105,6 +113,23 @@ class Config:
     # (critic) ještě + thinking trace. Defaulty 24 kB / 32 kB dávají bezpečnou
     # rezervu, aby nedošlo k uťatí výstupu.
     extractor_max_tokens: int = int(os.environ.get("EXTRACTOR_MAX_TOKENS", "24576"))
+    # Kontext serveru (SGLang --context-length / vLLM --max-model-len). Fáze 0
+    # si podle něj uřízne prompt, aby server nevrátil HTTP 400 "Requested token
+    # count exceeds the model's maximum context length".
+    extractor_context_len: int = int(os.environ.get("EXTRACTOR_CONTEXT_LEN", "65536"))
+    # Kontext critic serveru (SGLang --context-length / vLLM --max-model-len).
+    # Critic dostává text + navržené entity + taxonomii, takže se na dlouhých
+    # chuncích nejsnáz narazí na strop.
+    critic_context_len: int = int(os.environ.get("CRITIC_CONTEXT_LEN", "65536"))
+    # Strop na odpověď v fázi 0. Nižší než extractor_max_tokens: taxonomie je
+    # JSON s desítkami labelů, ne celý graf — a s reasoning=True je tohle
+    # i strop pro thinking trace (jinak llm_client tlačí minimum 16384).
+    taxonomy_max_tokens: int = int(os.environ.get("TAXONOMY_MAX_TOKENS", "8192"))
+    # Kolik znaků z každé ukázky jde do promptu fáze 0 (horní hranice; při
+    # těsném kontextu se zkracuje automaticky).
+    taxonomy_sample_preview_chars: int = int(
+        os.environ.get("TAXONOMY_SAMPLE_PREVIEW_CHARS", "600")
+    )
     critic_max_tokens: int = int(os.environ.get("CRITIC_MAX_TOKENS", "49152"))
     revisor_max_tokens: int = int(
         os.environ.get(
@@ -113,16 +138,82 @@ class Config:
     )
 
     data_dir: Path = Path(os.environ.get("DATA_DIR", "/app/data"))
+    # Jazyky (locale), které se ze Stage exportů načtou — čárkou oddělený
+    # seznam, např. "cs" nebo "cs,sk". Default (i prázdná hodnota) = "cs";
+    # všechny jazyky = "*". Schémata, jejichž allowedLocales nemají s výběrem
+    # průnik, se přeskočí celá; pole s locale mimo výběr se ignorují. "cs"
+    # matchuje i "cs-CZ" / "cs_CZ". Per-soubor přepis: klíč "locales"
+    # v labeler_config.json.
+    data_locales: str = os.environ.get("DATA_LOCALES") or "cs"
     checkpoint_dir: Path = Path(os.environ.get("CHECKPOINT_DIR", "/app/checkpoints"))
 
-    # Fáze 0 (taxonomy auto-discovery): kolik ukázek per dataset/doména se
-    # pošle LLM na návrh jednotné taxonomie. JEDNORÁZOVÁ konstanta nezávislá
-    # na velikosti datasetu (auto-discovery sampluje fixní počet, neškáluje se).
-    # Default 10 — vyšší = širší pokrytí domén, ale větší prompt (pozor na
-    # context window). Řídí produkci i smoke test stejně.
-    taxonomy_samples_per_dataset: int = int(
-        os.environ.get("TAXONOMY_SAMPLES_PER_DATASET", "10")
+    # Fáze 0 (taxonomy auto-discovery): kolik ukázek per doména dostane LLM
+    # na návrh taxonomie. TAXONOMY_SAMPLES_PER_DATASET:
+    #   auto (default) — počet si každá doména spočítá sama z rozmanitosti
+    #                    obsahu (embeddingy bge-m3 na vLLM, fáze 0a "sample" —
+    #                    viz labeler/taxonomy_sampling.py)
+    #   <číslo>        — přesně tolik ukázek per doména (vybraných embeddingy
+    #                    tak, aby pokryly co nejrůznější témata)
+    # Bez embedding kroku (nebo když selže) se vezme náhodný výběr s
+    # taxonomy_samples_per_dataset ukázkami (u 'auto' fallback 10).
+    taxonomy_samples_auto: bool = (
+        os.environ.get("TAXONOMY_SAMPLES_PER_DATASET", "auto").strip().lower() == "auto"
     )
+    taxonomy_samples_per_dataset: int = (
+        int(os.environ.get("TAXONOMY_SAMPLES_PER_DATASET", "auto"))
+        if os.environ.get("TAXONOMY_SAMPLES_PER_DATASET", "auto").strip().isdigit()
+        else 10
+    )
+    # --- Fáze 0a: výběr vzorků přes embeddingy (TAXONOMY_SAMPLES_PER_DATASET) --
+    # Mez počtu ukázek per doména v režimu auto.
+    taxonomy_sample_min: int = int(os.environ.get("TAXONOMY_SAMPLE_MIN", "5"))
+    taxonomy_sample_max: int = int(os.environ.get("TAXONOMY_SAMPLE_MAX", "60"))
+    # Pokrytí (auto): výběr končí, až má KAŽDÝ text domény ve vzorku zástupce
+    # s kosinovou podobností aspoň tolik. Vyšší = víc ukázek (jemnější pokrytí).
+    taxonomy_sample_coverage: float = float(
+        os.environ.get("TAXONOMY_SAMPLE_COVERAGE", "0.65")
+    )
+    # Strop součtu ukázek přes všechny domény — prompt fáze 0 se musí vejít
+    # do kontextu Qwenu (600 znaků/ukázka ≈ 170 tokenů; 200 ukázek ≈ 35k tokenů
+    # z 65k). Při překročení se ubere poměrně všem doménám (ty nejrůznější
+    # ukázky zůstanou — výběr je seřazený od nejodlišnější).
+    taxonomy_sample_max_total: int = int(
+        os.environ.get("TAXONOMY_SAMPLE_MAX_TOTAL", "200")
+    )
+    # Kolik textů per doména se max. zakóduje (větší doména → náhodný výběr);
+    # 0 = CELÝ dataset (default — na GPU přes vLLM jde o minuty).
+    taxonomy_sample_pool_max: int = int(
+        os.environ.get("TAXONOMY_SAMPLE_POOL_MAX", "0")
+    )
+    # global (default) — nejodlišnější témata z CELÉHO datasetu najednou
+    #   (cross-domain dedup, zástupce = nejtypičtější text tématu, šum se
+    #   nevybírá); domain — výběr per doména zvlášť (dřívější chování).
+    taxonomy_sample_scope: str = (
+        os.environ.get("TAXONOMY_SAMPLE_SCOPE", "global").strip().lower() or "global"
+    )
+    # Téma s méně texty je odlehlý šum (odkazy, kódy, útržky) — jeho text se
+    # jako ukázka nevybírá a nepočítá se do pokrytí (jen scope=global).
+    taxonomy_sample_min_cluster: int = int(
+        os.environ.get("TAXONOMY_SAMPLE_MIN_CLUSTER", "3")
+    )
+    # Embedding server (vLLM --runner pooling, profil embed-vllm, port 8002) —
+    # jediná část pipeline na vLLM.
+    embedding_base_url: str = os.environ.get(
+        "EMBEDDING_BASE_URL", "http://embedder-vllm:8002/v1"
+    )
+    # Kolik znaků textu se pošle do embeddingu (začátek textu nese téma).
+    embedding_max_chars: int = int(os.environ.get("EMBEDDING_MAX_CHARS", "2000"))
+    embedding_batch_size: int = int(os.environ.get("EMBEDDING_BATCH_SIZE", "64"))
+    # Chtěný počet kategorií v auto-discovered taxonomii. Vkládá se do
+    # promptu fáze 0 jako instrukce pro LLM; MIN navíc řídí kvalitativní
+    # bránu (viz min_llm_labels() v taxonomy.py). MAX je instrukce, ne tvrdý
+    # limit — když model navrhne víc validních labelů, pipeline je nezahazuje.
+    # 0 (nebo prázdné) = BEZ spodní hranice; vypne i kvalitativní bránu na
+    # počet navržených labelů.
+    taxonomy_min_labels: int = int(os.environ.get("TAXONOMY_MIN_LABELS") or "8")
+    # 0 (nebo prázdné) = BEZ horního stropu — model navrhne tolik kategorií,
+    # kolik dataset potřebuje. Spodní hranice platí dál.
+    taxonomy_max_labels: int = int(os.environ.get("TAXONOMY_MAX_LABELS") or "16")
 
     # --- Fáze 0 / Pilíř A: disjointness audit taxonomie --------------------
     # Po návrhu taxonomie (discover_taxonomy_auto) proběhne automatický audit,
@@ -156,6 +247,22 @@ class Config:
     taxonomy_audit_structural_edits: bool = _getenv_bool(
         "TAXONOMY_AUDIT_STRUCTURAL_EDITS", False
     )
+    # Čím se měří konfuze tříd v auditu (vyměnitelný "ruler"):
+    #   combined (DEFAULT) — OBOJÍ: embedding podobnost profilů tříd + LLM
+    #                    top-2 probe nad held-out spany; skóre i páry se spojí
+    #                    (viz taxonomy_audit_embedding_weight). Když jedno
+    #                    není dostupné, použije se druhé.
+    #   auto           — JEDNO z nich: embeddingy, když jsou dostupné, jinak
+    #                    LLM probe (původní chování)
+    #   embedding      — jen kosinová podobnost profilů tříd (deterministické,
+    #                    levné, bez LLM volání na měření)
+    #   llm            — jen LLM top-2 self-consistency probe nad held-out spany
+    taxonomy_audit_ruler: str = os.environ.get("TAXONOMY_AUDIT_RULER", "combined")
+    # Váha embedding měření v kombinovaném skóre (0-1); zbytek patří LLM probe.
+    # 1.0 = rozhodují embeddingy, 0.0 = rozhoduje LLM.
+    taxonomy_audit_embedding_weight: float = float(
+        os.environ.get("TAXONOMY_AUDIT_EMBEDDING_WEIGHT", "0.5")
+    )
 
     # --- Fáze 3 (finalize): korpusové hlasování o kategoriích ---------------
     # Finalize jako jediná fáze vidí celý korpus → statistika rozdělení
@@ -177,6 +284,86 @@ class Config:
     # (Nahrazuje dřívější hard-coded stopword seznam v normalize.)
     auto_expand_max_df_ratio: float = float(
         os.environ.get("AUTO_EXPAND_MAX_DF_RATIO", "0.5")
+    )
+
+    # --- Fáze 0b (volitelná): embedding analýza sémantické disjunktnosti ----
+    # Analýza tříd taxonomie přes sentence embeddingy + clustering. Výstupem
+    # jsou HEURISTICKÉ návrhy (possible_duplicate / possible_overlap /
+    # disjoint_candidate) — NE formální důkaz OWL disjunktnosti. Default ON —
+    # běží automaticky po každé tvorbě taxonomie (run_taxonomy_discovery).
+    taxonomy_embedding_enabled: bool = _getenv_bool(
+        "TAXONOMY_EMBEDDING_ENABLED", True
+    )
+    taxonomy_embedding_backend: str = os.environ.get(
+        "TAXONOMY_EMBEDDING_BACKEND", "sentence_transformers"
+    )
+    taxonomy_embedding_model: str = os.environ.get(
+        "TAXONOMY_EMBEDDING_MODEL", "BAAI/bge-m3",
+    )
+    taxonomy_embedding_device: str = os.environ.get(
+        "TAXONOMY_EMBEDDING_DEVICE", "auto"
+    )
+    taxonomy_embedding_batch_size: int = int(
+        os.environ.get("TAXONOMY_EMBEDDING_BATCH_SIZE", "32")
+    )
+    taxonomy_embedding_normalize: bool = _getenv_bool(
+        "TAXONOMY_EMBEDDING_NORMALIZE", True
+    )
+    # Mean-centering embeddingů (odstranění anizotropie). Bez něj se všechny
+    # párové podobnosti tísní ve vysokém pásmu a rozdíly mezi blízkými a
+    # vzdálenými třídami se ztrácejí. Default ON.
+    taxonomy_embedding_center: bool = _getenv_bool(
+        "TAXONOMY_EMBEDDING_CENTER", True
+    )
+    taxonomy_embedding_seed: int = int(
+        os.environ.get("TAXONOMY_EMBEDDING_SEED", "42")
+    )
+    # Kolik embeddingy označených zaměnitelných párů (possible_duplicate /
+    # possible_overlap) nechá fáze 0b LLM zostřit — výsledek (popis, hraniční
+    # pravidla, counter_examples) jde do entity_taxonomy.json. 0 = vypnuto.
+    taxonomy_embedding_refine_max_pairs: int = int(
+        os.environ.get("TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS", "10")
+    )
+    taxonomy_embedding_write_vectors: bool = _getenv_bool(
+        "TAXONOMY_EMBEDDING_WRITE_VECTORS", False
+    )
+    # Režim klasifikačních prahů:
+    #   relative (default) — z-skóre nad distribucí podobností dané taxonomie
+    #                        (median + škálovaná MAD); univerzální napříč
+    #                        modely a jazyky, bez ručního ladění
+    #   absolute           — pevné prahy kosinové podobnosti (legacy)
+    taxonomy_threshold_mode: str = os.environ.get(
+        "TAXONOMY_THRESHOLD_MODE", "relative"
+    )
+    # Prahy pro 'relative' mód (jednotky robustního z-skóre).
+    # Musí platit: disjoint_z < overlap_z <= duplicate_z.
+    taxonomy_duplicate_z: float = float(os.environ.get("TAXONOMY_DUPLICATE_Z", "2.5"))
+    taxonomy_overlap_z: float = float(os.environ.get("TAXONOMY_OVERLAP_Z", "1.0"))
+    taxonomy_disjoint_z: float = float(os.environ.get("TAXONOMY_DISJOINT_Z", "-0.5"))
+    # Prahy pro 'absolute' mód (kosinová podobnost). Musí platit:
+    # disjoint < overlap <= duplicate (validuje se před načtením modelu).
+    taxonomy_duplicate_similarity_threshold: float = float(
+        os.environ.get("TAXONOMY_DUPLICATE_SIMILARITY_THRESHOLD", "0.90")
+    )
+    taxonomy_overlap_similarity_threshold: float = float(
+        os.environ.get("TAXONOMY_OVERLAP_SIMILARITY_THRESHOLD", "0.72")
+    )
+    taxonomy_disjoint_similarity_threshold: float = float(
+        os.environ.get("TAXONOMY_DISJOINT_SIMILARITY_THRESHOLD", "0.30")
+    )
+    taxonomy_clustering_algorithm: str = os.environ.get(
+        "TAXONOMY_CLUSTERING_ALGORITHM", "agglomerative"
+    )
+    taxonomy_cluster_distance_threshold: float = float(
+        os.environ.get("TAXONOMY_CLUSTER_DISTANCE_THRESHOLD", "0.35")
+    )
+    # OWL export: jak naložit s disjoint_candidate páry z embedding reportu.
+    #   off      (default) — žádná změna OWL exportu
+    #   annotate — auditní anotace kandidátů (ŽÁDNÉ owl:disjointWith axiomy)
+    #   assert   — přidá owl:disjointWith (POZOR: heuristika, ne důkaz —
+    #              může vytvořit nesprávné logické axiomy)
+    taxonomy_owl_disjoint_mode: str = os.environ.get(
+        "TAXONOMY_OWL_DISJOINT_MODE", "off"
     )
 
     # --- Fáze 3 (finalize): deterministická lemmatizace přes Stanza ---------
@@ -224,6 +411,13 @@ class Config:
     critic_split_repetition_penalty: float = float(
         os.environ.get("CRITIC_SPLIT_REPETITION_PENALTY", "1.05")
     )
+
+    # Keyphrase entity (KEYPHRASE_* — delší popisné fráze: přínosy, použití,
+    # vlastnosti…) NEPATŘÍ do NER grafu. Default ON: finalize je přesune
+    # z graph do bloku "keyphrases" v témže záznamu final_labels; relace na
+    # ně se zachovají, pokud jsou bezpečné (viz finalize._split_keyphrases).
+    # false = původní chování (keyphrase zůstanou v graph).
+    final_exclude_keyphrases: bool = _getenv_bool("FINAL_EXCLUDE_KEYPHRASES", True)
 
     extraction_jsonl_name: str = "extractions.jsonl"
     critic_jsonl_name: str = "critic_results.jsonl"

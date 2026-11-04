@@ -4,7 +4,7 @@ x-gpu-deploy-extractor: &gpu-deploy-extractor
       reservations:
         devices:
           - driver: nvidia
-            # Default 1 (single-GPU bezpečný fallback). Pro 2/4× B200 nastav
+            # Default 1 (single-GPU bezpečný fallback). Pro 2/4× B200 / 2× RTX PRO 6000 nastav
             # EXTRACTOR_TP_SIZE před `docker compose up`, nebo použij
             # ./scripts/run_production.sh / run_smoke_test.sh (interaktivní
             # prompt 1/2/4). Pozn.: pokud zde bude 2 a host má jen 1 GPU,
@@ -29,9 +29,25 @@ x-gpu-deploy-critic: &gpu-deploy-critic
     memlock: -1
     stack: 67108864
 
+x-gpu-deploy-embedder: &gpu-deploy-embedder
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            # bge-m3 je malý (~1 GB vah), takže víc karet NEznamená větší
+            # model, ale víc REPLIK (data parallel) — kódování korpusu se
+            # rozloží. Default 1 = chování jako dřív.
+            count: ${EMBEDDING_GPU_COUNT:-1}
+            capabilities: [gpu]
+  shm_size: "8gb"
+
 x-label-vols: &label-vols
   - ${DATA_DIR:-./data}:/app/data:ro
   - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+  # HF cache (HF_HOME=/models v Dockerfile.labeler) — embedding model fáze
+  # taxonomie se stáhne jednou a sdílí s LLM kontejnery.
+  - ${MODEL_CACHE_DIR:-./models}:/models
 
 services:
 
@@ -92,17 +108,78 @@ services:
         if [ "$$EFF_PIECEWISE" = "1" ] || [ "$$EFF_PIECEWISE" = "true" ]; then
           PIECEWISE_FLAG="--disable-piecewise-cuda-graph"
         fi
+        # SGLang alokuje mamba/GDN conv cache podle SGLANG_MAMBA_CONV_DTYPE
+        # (default bf16) a IGNORUJE --dtype -> u fp16 modelu spadne prvni
+        # prefill na "Index put requires the source and destination dtypes
+        # match" (sgl-project/sglang#30178). Default = EXTRACTOR_DTYPE.
+        MAMBA_CONV_DTYPE="${SGLANG_MAMBA_CONV_DTYPE:-}"
+        if [ -z "$$MAMBA_CONV_DTYPE" ]; then
+          MAMBA_CONV_DTYPE="${EXTRACTOR_DTYPE:-}"
+        fi
+        if [ -n "$$MAMBA_CONV_DTYPE" ]; then
+          export SGLANG_MAMBA_CONV_DTYPE="$$MAMBA_CONV_DTYPE"
+        fi
+        # SGLang Marlin MoE (INT4 na Ampere) chce aktivace v dtype scales
+        # checkpointu — u nekterych INT4 vah je potreba DTYPE=float16.
+        # Prazdne = auto-detect z config.json.
+        DTYPE_FLAG=""
+        if [ -n "${EXTRACTOR_DTYPE:-}" ]; then
+          DTYPE_FLAG="--dtype=${EXTRACTOR_DTYPE:-}"
+        fi
+        # Diagnostika do logu: at je hned videt, s jakym dtype server
+        # startuje (fp16 vahy vs. bf16 GDN conv cache = sglang#30178).
+        # --language-model-only NEPOUZIVAME: SGLang ho podporuje jen pro
+        # MuseGlimmer/Cosmos3 architektury, u Gemma4 i Qwen3.5 server skonci
+        # na "ValueError: --language-model-only does not support [...]".
+        # Zapnout jen pro model, u ktereho to SGLang umi: LANGUAGE_MODEL_ONLY=1
+        LANG_ONLY_FLAG=""
+        if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
+          LANG_ONLY_FLAG="--language-model-only"
+        fi
+        # --- Mamba state pool (hybridni model: GDN vrstvy + full attention) ---
+        # U Qwen3.5-A10B NEurcuje souběžnost KV cache, ale mamba state pool.
+        # SGLang si ho bez --max-mamba-cache-size dopocita z
+        # --mamba-full-memory-ratio (default 0.9 = mamba:KV 0.9:1) a pak
+        # ZASTROPUJE --max-running-requests na
+        #   max_mamba_cache_size / sloty_na_request
+        # (5 pri strategii extra_buffer, 4 pri extra_buffer_lazy). V logu:
+        #   "max_running_requests is capped to N by the mamba state cache".
+        # Explicitni hodnota ratio PREBIJE: pool = (N+1) * slot, KV dostane
+        # zbytek. Prazdne = SGLang default (chovani jako dosud).
+        MAMBA_CACHE_FLAG=""
+        if [ -n "${EXTRACTOR_MAX_MAMBA_CACHE:-}" ]; then
+          MAMBA_CACHE_FLAG="--max-mamba-cache-size=${EXTRACTOR_MAX_MAMBA_CACHE:-}"
+        fi
+        # bfloat16 misto fp32 = polovicni slot (37 vs 73 MiB na GPU pri TP=2),
+        # tedy dvojnasobna souběžnost za stejnou pamet. Triton GDN kernel pocita
+        # v fp32 a jen PERSISTUJE stav v bf16 po kazdem tokenu -> je to zmena
+        # numeriky, nez to zapnes, over kvalitu na vzorku. Prazdne = fp32.
+        MAMBA_SSM_DTYPE_FLAG=""
+        if [ -n "${EXTRACTOR_MAMBA_SSM_DTYPE:-}" ]; then
+          MAMBA_SSM_DTYPE_FLAG="--mamba-ssm-dtype=${EXTRACTOR_MAMBA_SSM_DTYPE:-}"
+        fi
+        # extra_buffer_lazy odklada druhy tracking slot -> 4 sloty na request
+        # misto 5, tedy +25 % souběžnosti pri STEJNE pameti a STEJNE numerice.
+        # Vyzaduje overlap scheduler (default ON) a zadnou PD disagregaci.
+        # Prazdne = auto (= extra_buffer). Radix cache zustava zapnuta.
+        MAMBA_RADIX_FLAG=""
+        if [ -n "${EXTRACTOR_MAMBA_RADIX_STRATEGY:-}" ]; then
+          MAMBA_RADIX_FLAG="--mamba-radix-cache-strategy=${EXTRACTOR_MAMBA_RADIX_STRATEGY:-}"
+        fi
+        echo "[extractor] dtype: $${DTYPE_FLAG:-<auto>} | SGLANG_MAMBA_CONV_DTYPE=$${SGLANG_MAMBA_CONV_DTYPE:-<unset>}"
+        echo "[extractor] mamba: $${MAMBA_CACHE_FLAG:-<auto>} $${MAMBA_SSM_DTYPE_FLAG:-<fp32>} $${MAMBA_RADIX_FLAG:-<auto>}"
         exec python3 -m sglang.launch_server \
           --model-path=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4} \
           --host=0.0.0.0 \
           --port=8000 \
           --tp=${EXTRACTOR_TP_SIZE:-1} \
-          --mem-fraction-static=0.85 \
+          --mem-fraction-static=${EXTRACTOR_MEM_FRACTION:-0.85} \
           --max-running-requests=${EXTRACTOR_BATCH_SIZE:-32} \
           --context-length=${EXTRACTOR_CONTEXT_LEN:-65536} \
           --reasoning-parser=qwen3 \
           --trust-remote-code \
-          $$QUANT_FLAG $$PIECEWISE_FLAG
+          $$QUANT_FLAG $$PIECEWISE_FLAG $$DTYPE_FLAG $$LANG_ONLY_FLAG \
+          $$MAMBA_CACHE_FLAG $$MAMBA_SSM_DTYPE_FLAG $$MAMBA_RADIX_FLAG
     ports: ["8000:8000"]
     <<: *gpu-deploy-extractor
     healthcheck:
@@ -143,30 +220,41 @@ services:
     volumes:
       - ${MODEL_CACHE_DIR:-./models}:/models
     # Quantization flag se aplikuje na základě EXTRACTOR_QUANTIZATION env.
+    # Image vllm/vllm-openai má ENTRYPOINT ["vllm","serve"] → bez přepsání by
+    # se spustilo `vllm serve sh -c …` a server by nenaběhl.
+    entrypoint: ["sh", "-c"]
     command:
-      - sh
-      - -c
       - |
         QUANT_FLAG=""
         if [ -n "${EXTRACTOR_QUANTIZATION:-}" ]; then
           QUANT_FLAG="--quantization=${EXTRACTOR_QUANTIZATION:-}"
         fi
         # Pro NVFP4 MoE Qwen3.5 je nutný flashinfer_cutlass MoE backend
+        # flashinfer_cutlass MoE backend je pro NVFP4 na Blackwellu; na Ampere
+        # (A100: INT4/FP8 přes Marlin) se NESMÍ zapnout → řídí se MODELEM, ne
+        # jen tím, že je nastavená kvantizace.
         MOE_FLAG=""
-        if [ -n "${EXTRACTOR_QUANTIZATION:-}" ]; then
-          MOE_FLAG="--moe_backend=flashinfer_cutlass"
+        case "${EXTRACTOR_MODEL:-}" in
+          *NVFP4*|*nvfp4*|*-FP4*|*-fp4*) MOE_FLAG="--moe_backend=flashinfer_cutlass" ;;
+        esac
+        # SGLang Marlin MoE (INT4 na Ampere) chce aktivace v dtype scales
+        # checkpointu — u nekterych INT4 vah je potreba DTYPE=float16.
+        # Prazdne = auto-detect z config.json.
+        DTYPE_FLAG=""
+        if [ -n "${EXTRACTOR_DTYPE:-}" ]; then
+          DTYPE_FLAG="--dtype=${EXTRACTOR_DTYPE:-}"
         fi
         exec python3 -m vllm.entrypoints.openai.api_server \
           --model=${EXTRACTOR_MODEL:-RedHatAI/Qwen3.5-122B-A10B-NVFP4} \
           --host=0.0.0.0 \
           --port=8000 \
           --tensor-parallel-size=${EXTRACTOR_TP_SIZE:-2} \
-          --gpu-memory-utilization=0.85 \
+          --gpu-memory-utilization=${EXTRACTOR_MEM_FRACTION:-0.85} \
           --max-num-seqs=${EXTRACTOR_BATCH_SIZE:-32} \
           --max-model-len=${EXTRACTOR_CONTEXT_LEN:-65536} \
           --reasoning-parser=qwen3 \
           --language-model-only \
-          $$QUANT_FLAG $$MOE_FLAG
+          $$QUANT_FLAG $$MOE_FLAG $$DTYPE_FLAG
     ports: ["8000:8000"]
     <<: *gpu-deploy-extractor
     healthcheck:
@@ -221,15 +309,30 @@ services:
         if [ "$$EFF_PIECEWISE" = "1" ] || [ "$$EFF_PIECEWISE" = "true" ]; then
           PIECEWISE_FLAG="--disable-piecewise-cuda-graph"
         fi
+        # SGLang Marlin MoE (INT4 na Ampere) chce aktivace v dtype scales
+        # checkpointu — u nekterych INT4 vah je potreba DTYPE=float16.
+        # Prazdne = auto-detect z config.json.
+        DTYPE_FLAG=""
+        if [ -n "${CRITIC_DTYPE:-}" ]; then
+          DTYPE_FLAG="--dtype=${CRITIC_DTYPE:-}"
+        fi
+        # --language-model-only NEPOUZIVAME: SGLang ho podporuje jen pro
+        # MuseGlimmer/Cosmos3 architektury, u Gemma4 i Qwen3.5 server skonci
+        # na "ValueError: --language-model-only does not support [...]".
+        # Zapnout jen pro model, u ktereho to SGLang umi: LANGUAGE_MODEL_ONLY=1
+        LANG_ONLY_FLAG=""
+        if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
+          LANG_ONLY_FLAG="--language-model-only"
+        fi
         exec python3 -m sglang.launch_server \
           --model-path=${CRITIC_MODEL:-nvidia/Gemma-4-31B-IT-NVFP4} \
           --host=0.0.0.0 \
           --port=8001 \
           --tp=${CRITIC_TP_SIZE:-1} \
-          --mem-fraction-static=0.85 \
+          --mem-fraction-static=${CRITIC_MEM_FRACTION:-0.85} \
           --max-running-requests=${CRITIC_BATCH_SIZE:-64} \
           --context-length=${CRITIC_CONTEXT_LEN:-65536} \
-          $$QUANT_FLAG $$PIECEWISE_FLAG
+          $$QUANT_FLAG $$PIECEWISE_FLAG $$DTYPE_FLAG $$LANG_ONLY_FLAG
     ports: ["8001:8001"]
     <<: *gpu-deploy-critic
     healthcheck:
@@ -266,20 +369,28 @@ services:
       - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
     volumes:
       - ${MODEL_CACHE_DIR:-./models}:/models
+    # Image vllm/vllm-openai má ENTRYPOINT ["vllm","serve"] → bez přepsání by
+    # se spustilo `vllm serve sh -c …` a server by nenaběhl.
+    entrypoint: ["sh", "-c"]
     command:
-      - sh
-      - -c
       - |
         QUANT_FLAG=""
         if [ -n "${CRITIC_QUANTIZATION:-}" ]; then
           QUANT_FLAG="--quantization=${CRITIC_QUANTIZATION:-}"
+        fi
+        # SGLang Marlin MoE (INT4 na Ampere) chce aktivace v dtype scales
+        # checkpointu — u nekterych INT4 vah je potreba DTYPE=float16.
+        # Prazdne = auto-detect z config.json.
+        DTYPE_FLAG=""
+        if [ -n "${CRITIC_DTYPE:-}" ]; then
+          DTYPE_FLAG="--dtype=${CRITIC_DTYPE:-}"
         fi
         exec python3 -m vllm.entrypoints.openai.api_server \
           --model=${CRITIC_MODEL:-nvidia/Gemma-4-31B-IT-NVFP4} \
           --host=0.0.0.0 \
           --port=8001 \
           --tensor-parallel-size=${CRITIC_TP_SIZE:-1} \
-          --gpu-memory-utilization=0.85 \
+          --gpu-memory-utilization=${CRITIC_MEM_FRACTION:-0.85} \
           --max-num-seqs=${CRITIC_BATCH_SIZE:-64} \
           --max-model-len=${CRITIC_CONTEXT_LEN:-65536} \
           --reasoning-parser=gemma4 \
@@ -297,10 +408,99 @@ services:
       start_period: ${LLM_HEALTH_START_PERIOD:-3600s}
 
   # =========================================================================
+  # EMBEDDER — BAAI/bge-m3 na vLLM (fáze 0a: výběr vzorků pro taxonomii)
+  # =========================================================================
+  # JEDINÁ služba pipeline na vLLM (ostatní LLM běží na SGLang). vLLM má pro
+  # bge-m3 oficiální podporu: config.json deklaruje XLMRobertaModel, override
+  # na BgeM3EmbeddingModel načte správné embedding váhy (docs.vllm.ai →
+  # Pooling models → Specific Model Examples).
+  # Běží SÁM na GPU PŘED fází 0 (Qwen ještě neběží) — pravidlo "1 model na GPU".
+  # Image vllm/vllm-openai má ENTRYPOINT ["vllm","serve"] → přepsán na sh -c.
+  embedder-vllm:
+    profiles: ["embed-vllm"]
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: mudrc-embedder
+    restart: unless-stopped
+    environment:
+      - HF_HOME=/models
+      - HF_XET_HIGH_PERFORMANCE=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      - PYTHONWARNINGS=ignore::DeprecationWarning,ignore::FutureWarning
+      - TRANSFORMERS_VERBOSITY=error
+      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+    volumes:
+      - ${MODEL_CACHE_DIR:-./models}:/models
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        MODEL="${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}"
+        set -- --runner pooling
+        case "$$MODEL" in
+          *bge-m3*) set -- "$$@" --hf-overrides '{"architectures": ["BgeM3EmbeddingModel"]}' --pooler-config.task embed ;;
+        esac
+        # Víc karet = víc replik modelu (data parallel), ne větší model.
+        # bge-m3 se vejde na jednu kartu, takže tensor parallel by jen přidal
+        # komunikaci; DP rozloží dávky textů mezi karty.
+        DP="${EMBEDDING_GPU_COUNT:-1}"
+        if [ "$$DP" -gt 1 ]; then
+          set -- "$$@" --data-parallel-size "$$DP"
+        fi
+        exec vllm serve "$$MODEL" \
+          --host 0.0.0.0 \
+          --port 8002 \
+          --max-model-len 8192 \
+          --gpu-memory-utilization ${EMBEDDING_MEM_FRACTION:-0.3} \
+          "$$@"
+    ports: ["8002:8002"]
+    <<: *gpu-deploy-embedder
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8002/v1/models || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: ${LLM_HEALTH_START_PERIOD:-3600s}
+
+  # =========================================================================
   # LABELERS (Python HTTP klienti)
   # =========================================================================
+  # Fáze 0a — výběr vzorků pro taxonomii přes embeddingy (proti embedder-vllm).
+  labeler-embed-vllm:
+    profiles: ["embed-vllm"]
+    # Všechny labeler služby = JEDNA image (stejný Dockerfile i kontext) →
+    # `./scripts/build.sh` ji postaví jednou a použijí ji všechny fáze.
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
+    build: { context: ., dockerfile: Dockerfile.labeler }
+    depends_on:
+      embedder-vllm: { condition: service_healthy }
+    environment:
+      - EMBEDDING_BASE_URL=http://embedder-vllm:8002/v1
+      - EMBEDDING_BATCH_SIZE=${EMBEDDING_BATCH_SIZE:-64}
+      - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
+      - LLM_TIMEOUT_S=${LLM_TIMEOUT_S:-1800}
+      - TAXONOMY_EMBEDDING_MODEL=${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - TAXONOMY_OWL_DISJOINT_MODE=${TAXONOMY_OWL_DISJOINT_MODE:-off}
+      - FINAL_EXCLUDE_KEYPHRASES=${FINAL_EXCLUDE_KEYPHRASES:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-auto}
+      - TAXONOMY_SAMPLE_MIN=${TAXONOMY_SAMPLE_MIN:-5}
+      - TAXONOMY_SAMPLE_MAX=${TAXONOMY_SAMPLE_MAX:-60}
+      - TAXONOMY_SAMPLE_COVERAGE=${TAXONOMY_SAMPLE_COVERAGE:-0.65}
+      - TAXONOMY_SAMPLE_MAX_TOTAL=${TAXONOMY_SAMPLE_MAX_TOTAL:-200}
+      - TAXONOMY_SAMPLE_POOL_MAX=${TAXONOMY_SAMPLE_POOL_MAX:-0}
+      - TAXONOMY_SAMPLE_SCOPE=${TAXONOMY_SAMPLE_SCOPE:-global}
+      - TAXONOMY_SAMPLE_MIN_CLUSTER=${TAXONOMY_SAMPLE_MIN_CLUSTER:-3}
+      - EMBEDDING_MAX_CHARS=${EMBEDDING_MAX_CHARS:-2000}
+      - CHECKPOINT_DIR=/app/checkpoints
+      - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
+    volumes: *label-vols
+    command: ["taxonomy-sample"]
+    restart: "no"
+
   labeler-extract-vllm:
     profiles: ["extract-vllm"]
+    # Všechny labeler služby = JEDNA image (stejný Dockerfile i kontext) →
+    # `./scripts/build.sh` ji postaví jednou a použijí ji všechny fáze.
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     depends_on:
       extractor-vllm: { condition: service_healthy }
@@ -310,12 +510,33 @@ services:
       - EXTRACTOR_CONCURRENCY=${EXTRACTOR_CONCURRENCY:-32}
       - EXTRACTOR_REASONING=${EXTRACTOR_REASONING:-false}
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
+      - LLM_TIMEOUT_S=${LLM_TIMEOUT_S:-1800}
+      - TAXONOMY_REASONING=${TAXONOMY_REASONING:-true}
+      - TAXONOMY_MIN_LABELS=${TAXONOMY_MIN_LABELS:-8}
+      - TAXONOMY_MAX_LABELS=${TAXONOMY_MAX_LABELS:-16}
+      - TAXONOMY_AUDIT_RULER=${TAXONOMY_AUDIT_RULER:-combined}
+      - TAXONOMY_AUDIT_EMBEDDING_WEIGHT=${TAXONOMY_AUDIT_EMBEDDING_WEIGHT:-0.5}
+      - TAXONOMY_EMBEDDING_ENABLED=${TAXONOMY_EMBEDDING_ENABLED:-true}
+      - TAXONOMY_EMBEDDING_MODEL=${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - TAXONOMY_EMBEDDING_DEVICE=${TAXONOMY_EMBEDDING_DEVICE:-auto}
+      - TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS=${TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS:-10}
+      - TAXONOMY_OWL_DISJOINT_MODE=${TAXONOMY_OWL_DISJOINT_MODE:-off}
+      - FINAL_EXCLUDE_KEYPHRASES=${FINAL_EXCLUDE_KEYPHRASES:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-auto}
+      - TAXONOMY_SAMPLE_MIN=${TAXONOMY_SAMPLE_MIN:-5}
+      - TAXONOMY_SAMPLE_MAX=${TAXONOMY_SAMPLE_MAX:-60}
+      - TAXONOMY_SAMPLE_COVERAGE=${TAXONOMY_SAMPLE_COVERAGE:-0.65}
+      - TAXONOMY_SAMPLE_MAX_TOTAL=${TAXONOMY_SAMPLE_MAX_TOTAL:-200}
+      - TAXONOMY_SAMPLE_POOL_MAX=${TAXONOMY_SAMPLE_POOL_MAX:-0}
+      - TAXONOMY_SAMPLE_SCOPE=${TAXONOMY_SAMPLE_SCOPE:-global}
+      - TAXONOMY_SAMPLE_MIN_CLUSTER=${TAXONOMY_SAMPLE_MIN_CLUSTER:-3}
+      - EMBEDDING_MAX_CHARS=${EMBEDDING_MAX_CHARS:-2000}
       - CHECKPOINT_DIR=/app/checkpoints
       - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
       - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
       - EXTRACTOR_NER_MAX_TOKENS=${EXTRACTOR_NER_MAX_TOKENS:-8192}
       - EXTRACTOR_SPLIT_REPETITION_PENALTY=${EXTRACTOR_SPLIT_REPETITION_PENALTY:-1.05}
-      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
     volumes: *label-vols
     command: >
       extract ${EXTRACT_EXTRA_ARGS:-}
@@ -323,6 +544,9 @@ services:
 
   labeler-extract-sglang:
     profiles: ["extract-sglang"]
+    # Všechny labeler služby = JEDNA image (stejný Dockerfile i kontext) →
+    # `./scripts/build.sh` ji postaví jednou a použijí ji všechny fáze.
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     depends_on:
       extractor-sglang: { condition: service_healthy }
@@ -332,12 +556,33 @@ services:
       - EXTRACTOR_CONCURRENCY=${EXTRACTOR_CONCURRENCY:-32}
       - EXTRACTOR_REASONING=${EXTRACTOR_REASONING:-false}
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
+      - LLM_TIMEOUT_S=${LLM_TIMEOUT_S:-1800}
+      - TAXONOMY_REASONING=${TAXONOMY_REASONING:-true}
+      - TAXONOMY_MIN_LABELS=${TAXONOMY_MIN_LABELS:-8}
+      - TAXONOMY_MAX_LABELS=${TAXONOMY_MAX_LABELS:-16}
+      - TAXONOMY_AUDIT_RULER=${TAXONOMY_AUDIT_RULER:-combined}
+      - TAXONOMY_AUDIT_EMBEDDING_WEIGHT=${TAXONOMY_AUDIT_EMBEDDING_WEIGHT:-0.5}
+      - TAXONOMY_EMBEDDING_ENABLED=${TAXONOMY_EMBEDDING_ENABLED:-true}
+      - TAXONOMY_EMBEDDING_MODEL=${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - TAXONOMY_EMBEDDING_DEVICE=${TAXONOMY_EMBEDDING_DEVICE:-auto}
+      - TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS=${TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS:-10}
+      - TAXONOMY_OWL_DISJOINT_MODE=${TAXONOMY_OWL_DISJOINT_MODE:-off}
+      - FINAL_EXCLUDE_KEYPHRASES=${FINAL_EXCLUDE_KEYPHRASES:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-auto}
+      - TAXONOMY_SAMPLE_MIN=${TAXONOMY_SAMPLE_MIN:-5}
+      - TAXONOMY_SAMPLE_MAX=${TAXONOMY_SAMPLE_MAX:-60}
+      - TAXONOMY_SAMPLE_COVERAGE=${TAXONOMY_SAMPLE_COVERAGE:-0.65}
+      - TAXONOMY_SAMPLE_MAX_TOTAL=${TAXONOMY_SAMPLE_MAX_TOTAL:-200}
+      - TAXONOMY_SAMPLE_POOL_MAX=${TAXONOMY_SAMPLE_POOL_MAX:-0}
+      - TAXONOMY_SAMPLE_SCOPE=${TAXONOMY_SAMPLE_SCOPE:-global}
+      - TAXONOMY_SAMPLE_MIN_CLUSTER=${TAXONOMY_SAMPLE_MIN_CLUSTER:-3}
+      - EMBEDDING_MAX_CHARS=${EMBEDDING_MAX_CHARS:-2000}
       - CHECKPOINT_DIR=/app/checkpoints
       - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
       - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
       - EXTRACTOR_NER_MAX_TOKENS=${EXTRACTOR_NER_MAX_TOKENS:-8192}
       - EXTRACTOR_SPLIT_REPETITION_PENALTY=${EXTRACTOR_SPLIT_REPETITION_PENALTY:-1.05}
-      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
     volumes: *label-vols
     command: >
       extract ${EXTRACT_EXTRA_ARGS:-}
@@ -348,6 +593,9 @@ services:
   # extractor_revised — to dělá až fáze 2b (labeler-revise-{backend}).
   labeler-critic-vllm:
     profiles: ["critic-vllm"]
+    # Všechny labeler služby = JEDNA image (stejný Dockerfile i kontext) →
+    # `./scripts/build.sh` ji postaví jednou a použijí ji všechny fáze.
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     depends_on:
       critic-vllm: { condition: service_healthy }
@@ -359,16 +607,40 @@ services:
       - CRITIC_MAX_TOKENS=${CRITIC_MAX_TOKENS:-49152}
       - CRITIC_SPLIT_REPETITION_PENALTY=${CRITIC_SPLIT_REPETITION_PENALTY:-1.05}
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
+      - LLM_TIMEOUT_S=${LLM_TIMEOUT_S:-1800}
+      - TAXONOMY_REASONING=${TAXONOMY_REASONING:-true}
+      - TAXONOMY_MIN_LABELS=${TAXONOMY_MIN_LABELS:-8}
+      - TAXONOMY_MAX_LABELS=${TAXONOMY_MAX_LABELS:-16}
+      - TAXONOMY_AUDIT_RULER=${TAXONOMY_AUDIT_RULER:-combined}
+      - TAXONOMY_AUDIT_EMBEDDING_WEIGHT=${TAXONOMY_AUDIT_EMBEDDING_WEIGHT:-0.5}
+      - TAXONOMY_EMBEDDING_ENABLED=${TAXONOMY_EMBEDDING_ENABLED:-true}
+      - TAXONOMY_EMBEDDING_MODEL=${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - TAXONOMY_EMBEDDING_DEVICE=${TAXONOMY_EMBEDDING_DEVICE:-auto}
+      - TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS=${TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS:-10}
+      - TAXONOMY_OWL_DISJOINT_MODE=${TAXONOMY_OWL_DISJOINT_MODE:-off}
+      - FINAL_EXCLUDE_KEYPHRASES=${FINAL_EXCLUDE_KEYPHRASES:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-auto}
+      - TAXONOMY_SAMPLE_MIN=${TAXONOMY_SAMPLE_MIN:-5}
+      - TAXONOMY_SAMPLE_MAX=${TAXONOMY_SAMPLE_MAX:-60}
+      - TAXONOMY_SAMPLE_COVERAGE=${TAXONOMY_SAMPLE_COVERAGE:-0.65}
+      - TAXONOMY_SAMPLE_MAX_TOTAL=${TAXONOMY_SAMPLE_MAX_TOTAL:-200}
+      - TAXONOMY_SAMPLE_POOL_MAX=${TAXONOMY_SAMPLE_POOL_MAX:-0}
+      - TAXONOMY_SAMPLE_SCOPE=${TAXONOMY_SAMPLE_SCOPE:-global}
+      - TAXONOMY_SAMPLE_MIN_CLUSTER=${TAXONOMY_SAMPLE_MIN_CLUSTER:-3}
+      - EMBEDDING_MAX_CHARS=${EMBEDDING_MAX_CHARS:-2000}
       - CHECKPOINT_DIR=/app/checkpoints
       - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
       - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
-      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
     volumes: *label-vols
     command: ["critic"]
     restart: "no"
 
   labeler-critic-sglang:
     profiles: ["critic-sglang"]
+    # Všechny labeler služby = JEDNA image (stejný Dockerfile i kontext) →
+    # `./scripts/build.sh` ji postaví jednou a použijí ji všechny fáze.
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     depends_on:
       critic-sglang: { condition: service_healthy }
@@ -380,10 +652,31 @@ services:
       - CRITIC_MAX_TOKENS=${CRITIC_MAX_TOKENS:-49152}
       - CRITIC_SPLIT_REPETITION_PENALTY=${CRITIC_SPLIT_REPETITION_PENALTY:-1.05}
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
+      - LLM_TIMEOUT_S=${LLM_TIMEOUT_S:-1800}
+      - TAXONOMY_REASONING=${TAXONOMY_REASONING:-true}
+      - TAXONOMY_MIN_LABELS=${TAXONOMY_MIN_LABELS:-8}
+      - TAXONOMY_MAX_LABELS=${TAXONOMY_MAX_LABELS:-16}
+      - TAXONOMY_AUDIT_RULER=${TAXONOMY_AUDIT_RULER:-combined}
+      - TAXONOMY_AUDIT_EMBEDDING_WEIGHT=${TAXONOMY_AUDIT_EMBEDDING_WEIGHT:-0.5}
+      - TAXONOMY_EMBEDDING_ENABLED=${TAXONOMY_EMBEDDING_ENABLED:-true}
+      - TAXONOMY_EMBEDDING_MODEL=${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - TAXONOMY_EMBEDDING_DEVICE=${TAXONOMY_EMBEDDING_DEVICE:-auto}
+      - TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS=${TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS:-10}
+      - TAXONOMY_OWL_DISJOINT_MODE=${TAXONOMY_OWL_DISJOINT_MODE:-off}
+      - FINAL_EXCLUDE_KEYPHRASES=${FINAL_EXCLUDE_KEYPHRASES:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-auto}
+      - TAXONOMY_SAMPLE_MIN=${TAXONOMY_SAMPLE_MIN:-5}
+      - TAXONOMY_SAMPLE_MAX=${TAXONOMY_SAMPLE_MAX:-60}
+      - TAXONOMY_SAMPLE_COVERAGE=${TAXONOMY_SAMPLE_COVERAGE:-0.65}
+      - TAXONOMY_SAMPLE_MAX_TOTAL=${TAXONOMY_SAMPLE_MAX_TOTAL:-200}
+      - TAXONOMY_SAMPLE_POOL_MAX=${TAXONOMY_SAMPLE_POOL_MAX:-0}
+      - TAXONOMY_SAMPLE_SCOPE=${TAXONOMY_SAMPLE_SCOPE:-global}
+      - TAXONOMY_SAMPLE_MIN_CLUSTER=${TAXONOMY_SAMPLE_MIN_CLUSTER:-3}
+      - EMBEDDING_MAX_CHARS=${EMBEDDING_MAX_CHARS:-2000}
       - CHECKPOINT_DIR=/app/checkpoints
       - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
       - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
-      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
     volumes: *label-vols
     command: ["critic"]
     restart: "no"
@@ -394,6 +687,9 @@ services:
   # pro jiný model/endpoint nastav REVISOR_* v .env.
   labeler-revise-vllm:
     profiles: ["revise-vllm"]
+    # Všechny labeler služby = JEDNA image (stejný Dockerfile i kontext) →
+    # `./scripts/build.sh` ji postaví jednou a použijí ji všechny fáze.
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     depends_on:
       extractor-vllm: { condition: service_healthy }
@@ -410,16 +706,40 @@ services:
       - REVISOR_CONCURRENCY
       - REVISOR_MAX_TOKENS
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
+      - LLM_TIMEOUT_S=${LLM_TIMEOUT_S:-1800}
+      - TAXONOMY_REASONING=${TAXONOMY_REASONING:-true}
+      - TAXONOMY_MIN_LABELS=${TAXONOMY_MIN_LABELS:-8}
+      - TAXONOMY_MAX_LABELS=${TAXONOMY_MAX_LABELS:-16}
+      - TAXONOMY_AUDIT_RULER=${TAXONOMY_AUDIT_RULER:-combined}
+      - TAXONOMY_AUDIT_EMBEDDING_WEIGHT=${TAXONOMY_AUDIT_EMBEDDING_WEIGHT:-0.5}
+      - TAXONOMY_EMBEDDING_ENABLED=${TAXONOMY_EMBEDDING_ENABLED:-true}
+      - TAXONOMY_EMBEDDING_MODEL=${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - TAXONOMY_EMBEDDING_DEVICE=${TAXONOMY_EMBEDDING_DEVICE:-auto}
+      - TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS=${TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS:-10}
+      - TAXONOMY_OWL_DISJOINT_MODE=${TAXONOMY_OWL_DISJOINT_MODE:-off}
+      - FINAL_EXCLUDE_KEYPHRASES=${FINAL_EXCLUDE_KEYPHRASES:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-auto}
+      - TAXONOMY_SAMPLE_MIN=${TAXONOMY_SAMPLE_MIN:-5}
+      - TAXONOMY_SAMPLE_MAX=${TAXONOMY_SAMPLE_MAX:-60}
+      - TAXONOMY_SAMPLE_COVERAGE=${TAXONOMY_SAMPLE_COVERAGE:-0.65}
+      - TAXONOMY_SAMPLE_MAX_TOTAL=${TAXONOMY_SAMPLE_MAX_TOTAL:-200}
+      - TAXONOMY_SAMPLE_POOL_MAX=${TAXONOMY_SAMPLE_POOL_MAX:-0}
+      - TAXONOMY_SAMPLE_SCOPE=${TAXONOMY_SAMPLE_SCOPE:-global}
+      - TAXONOMY_SAMPLE_MIN_CLUSTER=${TAXONOMY_SAMPLE_MIN_CLUSTER:-3}
+      - EMBEDDING_MAX_CHARS=${EMBEDDING_MAX_CHARS:-2000}
       - CHECKPOINT_DIR=/app/checkpoints
       - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
       - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
-      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
     volumes: *label-vols
     command: ["revise"]
     restart: "no"
 
   labeler-revise-sglang:
     profiles: ["revise-sglang"]
+    # Všechny labeler služby = JEDNA image (stejný Dockerfile i kontext) →
+    # `./scripts/build.sh` ji postaví jednou a použijí ji všechny fáze.
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     depends_on:
       extractor-sglang: { condition: service_healthy }
@@ -436,10 +756,31 @@ services:
       - REVISOR_CONCURRENCY
       - REVISOR_MAX_TOKENS
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
+      - LLM_TIMEOUT_S=${LLM_TIMEOUT_S:-1800}
+      - TAXONOMY_REASONING=${TAXONOMY_REASONING:-true}
+      - TAXONOMY_MIN_LABELS=${TAXONOMY_MIN_LABELS:-8}
+      - TAXONOMY_MAX_LABELS=${TAXONOMY_MAX_LABELS:-16}
+      - TAXONOMY_AUDIT_RULER=${TAXONOMY_AUDIT_RULER:-combined}
+      - TAXONOMY_AUDIT_EMBEDDING_WEIGHT=${TAXONOMY_AUDIT_EMBEDDING_WEIGHT:-0.5}
+      - TAXONOMY_EMBEDDING_ENABLED=${TAXONOMY_EMBEDDING_ENABLED:-true}
+      - TAXONOMY_EMBEDDING_MODEL=${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - TAXONOMY_EMBEDDING_DEVICE=${TAXONOMY_EMBEDDING_DEVICE:-auto}
+      - TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS=${TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS:-10}
+      - TAXONOMY_OWL_DISJOINT_MODE=${TAXONOMY_OWL_DISJOINT_MODE:-off}
+      - FINAL_EXCLUDE_KEYPHRASES=${FINAL_EXCLUDE_KEYPHRASES:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-auto}
+      - TAXONOMY_SAMPLE_MIN=${TAXONOMY_SAMPLE_MIN:-5}
+      - TAXONOMY_SAMPLE_MAX=${TAXONOMY_SAMPLE_MAX:-60}
+      - TAXONOMY_SAMPLE_COVERAGE=${TAXONOMY_SAMPLE_COVERAGE:-0.65}
+      - TAXONOMY_SAMPLE_MAX_TOTAL=${TAXONOMY_SAMPLE_MAX_TOTAL:-200}
+      - TAXONOMY_SAMPLE_POOL_MAX=${TAXONOMY_SAMPLE_POOL_MAX:-0}
+      - TAXONOMY_SAMPLE_SCOPE=${TAXONOMY_SAMPLE_SCOPE:-global}
+      - TAXONOMY_SAMPLE_MIN_CLUSTER=${TAXONOMY_SAMPLE_MIN_CLUSTER:-3}
+      - EMBEDDING_MAX_CHARS=${EMBEDDING_MAX_CHARS:-2000}
       - CHECKPOINT_DIR=/app/checkpoints
       - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
       - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
-      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
     volumes: *label-vols
     command: ["revise"]
     restart: "no"
@@ -449,13 +790,37 @@ services:
   # =========================================================================
   labeler-finalize:
     profiles: ["finalize"]
+    # Všechny labeler služby = JEDNA image (stejný Dockerfile i kontext) →
+    # `./scripts/build.sh` ji postaví jednou a použijí ji všechny fáze.
+    image: ${LABELER_IMAGE:-llm-ner-re-annotator:latest}
     build: { context: ., dockerfile: Dockerfile.labeler }
     environment:
       - DATA_DIR=/app/data
+      - DATA_LOCALES=${DATA_LOCALES:-cs}
+      - LLM_TIMEOUT_S=${LLM_TIMEOUT_S:-1800}
+      - TAXONOMY_REASONING=${TAXONOMY_REASONING:-true}
+      - TAXONOMY_MIN_LABELS=${TAXONOMY_MIN_LABELS:-8}
+      - TAXONOMY_MAX_LABELS=${TAXONOMY_MAX_LABELS:-16}
+      - TAXONOMY_AUDIT_RULER=${TAXONOMY_AUDIT_RULER:-combined}
+      - TAXONOMY_AUDIT_EMBEDDING_WEIGHT=${TAXONOMY_AUDIT_EMBEDDING_WEIGHT:-0.5}
+      - TAXONOMY_EMBEDDING_ENABLED=${TAXONOMY_EMBEDDING_ENABLED:-true}
+      - TAXONOMY_EMBEDDING_MODEL=${TAXONOMY_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - TAXONOMY_EMBEDDING_DEVICE=${TAXONOMY_EMBEDDING_DEVICE:-auto}
+      - TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS=${TAXONOMY_EMBEDDING_REFINE_MAX_PAIRS:-10}
+      - TAXONOMY_OWL_DISJOINT_MODE=${TAXONOMY_OWL_DISJOINT_MODE:-off}
+      - FINAL_EXCLUDE_KEYPHRASES=${FINAL_EXCLUDE_KEYPHRASES:-true}
+      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-auto}
+      - TAXONOMY_SAMPLE_MIN=${TAXONOMY_SAMPLE_MIN:-5}
+      - TAXONOMY_SAMPLE_MAX=${TAXONOMY_SAMPLE_MAX:-60}
+      - TAXONOMY_SAMPLE_COVERAGE=${TAXONOMY_SAMPLE_COVERAGE:-0.65}
+      - TAXONOMY_SAMPLE_MAX_TOTAL=${TAXONOMY_SAMPLE_MAX_TOTAL:-200}
+      - TAXONOMY_SAMPLE_POOL_MAX=${TAXONOMY_SAMPLE_POOL_MAX:-0}
+      - TAXONOMY_SAMPLE_SCOPE=${TAXONOMY_SAMPLE_SCOPE:-global}
+      - TAXONOMY_SAMPLE_MIN_CLUSTER=${TAXONOMY_SAMPLE_MIN_CLUSTER:-3}
+      - EMBEDDING_MAX_CHARS=${EMBEDDING_MAX_CHARS:-2000}
       - CHECKPOINT_DIR=/app/checkpoints
       - CHUNK_MAX_CHARS=${CHUNK_MAX_CHARS:-12000}
       - SPLIT_NER_RE=${SPLIT_NER_RE:-true}
-      - TAXONOMY_SAMPLES_PER_DATASET=${TAXONOMY_SAMPLES_PER_DATASET:-10}
     volumes:
       - ${CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
     command: ["finalize"]

@@ -101,4 +101,4 @@ if [ -f checkpoints/stats.json ]; then
     cat checkpoints/stats.json
 fi
 
-log "✅ TEST HOTOVÝ. Pošli Claudovi obsah checkpoints/ (zejména final_labels.jsonl a stats.json)."
+log "✅ TEST HOTOVÝ. Výsledky jsou v checkpoints/ (zejména final_labels.jsonl a stats.json)."

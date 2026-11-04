@@ -253,6 +253,7 @@ async def run_extraction(
         max_concurrency=CONFIG.extractor_concurrency,
         request_timeout=CONFIG.request_timeout_s,
         max_retries=CONFIG.max_retries,
+        context_len=CONFIG.extractor_context_len,
     ) as client:
         await client.wait_ready(max_wait_s=1200)
 

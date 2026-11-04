@@ -19,7 +19,8 @@ Výstup je VŽDY `entity_taxonomy.json` v CHECKPOINT_DIR — později ho extract
 přebere a doplní do promptu místo defaultu.
 
 Konzistence napříč datasety v auto módu:
-  1. Pro každý dataset vezmi N náhodných ukázek (default 10).
+  1. Pro každou doménu vezmi ukázky vybrané embeddingy ve fázi 0a
+     (taxonomy_sampling.json), jinak N náhodných (default 10).
   2. Pošli LLM jeden velký prompt: "Tady máš ukázky z domén X, Y, Z. Navrhni
      UNIVERZÁLNÍ taxonomii NER labelů. Stejný koncept = stejný label, i když
      se v různých doménách projevuje jinak."
@@ -116,6 +117,17 @@ class TaxonomyLabel:
     #   counter_examples výrazy, které vypadají jako tenhle label, ale patří jinam
     decision_rule: str = ""
     counter_examples: list[str] = field(default_factory=list)
+    # === Embeddingové vztahy (fáze 0b) =======================================
+    # Vyplňuje je AUTOMATICKY embedding analýza po tvorbě taxonomie (viz
+    # annotate_taxonomy_with_embeddings). Heuristika, NE logický důkaz.
+    #   confusable_with      třídy, se kterými je tahle v embedding prostoru
+    #                        zaměnitelná (possible_duplicate / possible_overlap),
+    #                        od nejpodobnější — renderují se do promptu extractoru
+    #   disjoint_candidates  třídy daleko v embedding prostoru (disjoint_candidate)
+    #   embedding_cluster    id clusteru z aglomerativního clusteringu (-1 = neznámý)
+    confusable_with: list[str] = field(default_factory=list)
+    disjoint_candidates: list[str] = field(default_factory=list)
+    embedding_cluster: int = -1
     # === Normalizační metadata (nahrazují hard-coded DEFAULT_LABEL_MAPPING) ===
     # kind:      "ner" = tvrdá NER kategorie (krátké pojmenovatelné spany —
     #            produkty, organizace, místa, data, hodnoty); "keyphrase" =
@@ -144,6 +156,9 @@ class TaxonomyLabel:
             case_sensitive=bool(d.get("case_sensitive", False)),
             decision_rule=str(d.get("decision_rule", "")).strip(),
             counter_examples=[str(x) for x in (d.get("counter_examples") or [])],
+            confusable_with=[str(x) for x in (d.get("confusable_with") or [])],
+            disjoint_candidates=[str(x) for x in (d.get("disjoint_candidates") or [])],
+            embedding_cluster=int(d.get("embedding_cluster", -1)),
             kind=str(d.get("kind", "ner")).strip().lower() or "ner",
             remap_to=str(d.get("remap_to", "")).strip(),
         )
@@ -191,6 +206,9 @@ class Taxonomy:
     generated_at: str = ""
     source_datasets: list[str] = field(default_factory=list)
     notes: str = ""
+    # Souhrn embedding analýzy (model, distribuce podobností, počty párů…) —
+    # vyplňuje annotate_taxonomy_with_embeddings. Prázdné = analýza neproběhla.
+    embedding_analysis: dict = field(default_factory=dict)
 
     @property
     def codes(self) -> list[str]:
@@ -203,6 +221,7 @@ class Taxonomy:
             "generated_at": self.generated_at,
             "source_datasets": self.source_datasets,
             "notes": self.notes,
+            "embedding_analysis": self.embedding_analysis,
             "labels": [lb.to_dict() for lb in self.labels],
         }
 
@@ -217,6 +236,7 @@ class Taxonomy:
             generated_at=str(d.get("generated_at", "")),
             source_datasets=list(d.get("source_datasets", [])),
             notes=str(d.get("notes", "")),
+            embedding_analysis=dict(d.get("embedding_analysis") or {}),
         )
 
     def validate(self) -> list[str]:
@@ -437,8 +457,8 @@ ZÁKLADNÍ PRAVIDLA:
    Labely musí být anglické (nebo české bez diakritiky), velkými písmeny,
    slova oddělená podtržítkem. Délka 2-50 znaků. Pattern: [A-Z][A-Z0-9_]{0,49}
 
-4. ROZUMNÝ POČET (8-16 labelů)
-   Příliš málo = neinformativní; příliš mnoho = nekonzistentní LLM výstup.
+4. POČET LABELŮ
+{LABEL_COUNT_RULE}
 
 5. KAŽDÝ LABEL MUSÍ MÍT
    - code (UPPERCASE_SNAKE)
@@ -501,6 +521,83 @@ VRÁTÍŠ POUZE VALIDNÍ JSON v tomto formátu (žádný markdown, žádný text
 """
 
 
+# Připomínka pro případy bez stropu: neomezený seznam je přesně místo, kde
+# vznikají překrývající se kategorie.
+_DISTINGUISHABLE_NOTE = (
+    "   Pozor: labely musí zůstat navzájem odlišitelné. Radši jeden label\n"
+    "   s jasnou hranicí než dva, mezi kterými se nerozhodneš."
+)
+
+
+def label_count_rule(lo: int, hi: int) -> str:
+    """
+    Text pravidla o počtu labelů pro prompt fáze 0.
+
+    lo <= 0 = bez spodní hranice, hi <= 0 = bez horního stropu (lze obojí).
+    Normalizuje nekonzistentní vstup (0 < hi < lo → hi = lo), ať nevznikne
+    nesmyslný rozsah typu "10-5" bez ohledu na to, odkud se funkce volá.
+    """
+    lo = max(0, lo)
+    hi = max(0, hi)
+    if 0 < hi < lo:
+        hi = lo
+
+    if lo <= 0 and hi <= 0:
+        return (
+            "   POČET LABELŮ NENÍ NIJAK OMEZENÝ — udělej jich přesně tolik,\n"
+            "   kolik dataset potřebuje, aby každá entita měla přesný label\n"
+            "   a nemusela padat do obecného koše.\n"
+            + _DISTINGUISHABLE_NOTE
+        )
+    if hi <= 0:
+        return (
+            f"   Navrhni aspoň {lo} labelů. HORNÍ HRANICE NENÍ STANOVENÁ — udělej\n"
+            f"   jich tolik, kolik dataset skutečně potřebuje, aby každá entita\n"
+            f"   měla přesný label a nemusela padat do obecného koše.\n"
+            + _DISTINGUISHABLE_NOTE
+        )
+    if lo <= 0:
+        return (
+            f"   Navrhni nejvýš {hi} labelů. SPODNÍ HRANICE NENÍ STANOVENÁ —\n"
+            f"   když dataset pokryje míň kategorií, je to v pořádku; nevymýšlej\n"
+            f"   labely jen kvůli počtu.\n"
+            + _DISTINGUISHABLE_NOTE
+        )
+    return (
+        f"   Rozumný počet je {lo}-{hi} labelů.\n"
+        f"   Příliš málo = neinformativní; příliš mnoho = nekonzistentní LLM výstup."
+    )
+
+
+def taxonomy_system_prompt(
+    min_labels: Optional[int] = None, max_labels: Optional[int] = None,
+) -> str:
+    """Systémový prompt fáze 0 s dosazeným počtem labelů
+    (TAXONOMY_MIN_LABELS / TAXONOMY_MAX_LABELS, default 8-16).
+
+    0 (nebo prázdné) vypne příslušnou hranici:
+      TAXONOMY_MAX_LABELS=0 → bez horního stropu
+      TAXONOMY_MIN_LABELS=0 → bez spodní hranice (vypne i kvalitativní bránu
+                              na počet labelů, viz min_llm_labels())
+    Lze obojí najednou — pak počet labelů neomezuje nic.
+
+    Dosazuje se přes .replace() — prompt obsahuje literální složené závorky
+    (regex pattern, JSON příklad), takže .format() nelze použít. Nekonzistentní
+    rozsah (0 < max < min) se srovná na max = min."""
+    lo = CONFIG.taxonomy_min_labels if min_labels is None else min_labels
+    hi = CONFIG.taxonomy_max_labels if max_labels is None else max_labels
+    lo = max(0, lo)
+    hi = max(0, hi)
+    if 0 < hi < lo:
+        hi = lo
+    return (
+        TAXONOMY_SYSTEM_PROMPT
+        .replace("{LABEL_COUNT_RULE}", label_count_rule(lo, hi))
+        .replace("{MIN_LABELS}", str(lo) if lo > 0 else "bez minima")
+        .replace("{MAX_LABELS}", str(hi) if hi > 0 else "bez stropu")
+    )
+
+
 TAXONOMY_USER_TEMPLATE = """DOMÉNY V DATASETU:
 {domains_block}
 
@@ -514,22 +611,86 @@ Vrať validní JSON v dokumentovaném formátu."""
 
 def _format_samples_for_prompt(
     samples_by_domain: dict[str, list[str]],
+    preview_chars: Optional[int] = None,
 ) -> tuple[str, str]:
     """
     Vytvoří dva bloky:
       domains_block: bulletový seznam domén
       samples_block: ukázky textů per doména
     """
+    cap = preview_chars or CONFIG.taxonomy_sample_preview_chars
     domains_block = "\n".join(f"  - {d}" for d in sorted(samples_by_domain.keys()))
     samples_block_parts = []
     for d in sorted(samples_by_domain.keys()):
         samples = samples_by_domain[d]
         samples_block_parts.append(f"=== {d} ===")
         for i, s in enumerate(samples, 1):
-            preview = s[:600].replace("\n", " ")
+            preview = s[:cap].replace("\n", " ")
             samples_block_parts.append(f"  [{i}] {preview}")
         samples_block_parts.append("")
     return domains_block, "\n".join(samples_block_parts)
+
+
+# Hrubý převod znaků na tokeny. Qwen tokenizer dělá u české diakritiky ~2,5-3
+# znaky/token; 2.5 je konzervativní (radši prompt uříznu víc, než abych dostal
+# HTTP 400 a spadl na default 16 kategorií).
+_CHARS_PER_TOKEN = 2.5
+
+
+def _prompt_char_budget(completion_tokens: int, reserve_tokens: int = 1536) -> int:
+    """Kolik znaků promptu se vejde do kontextu serveru vedle odpovědi."""
+    ctx = max(4096, CONFIG.extractor_context_len)
+    usable = ctx - completion_tokens - reserve_tokens
+    if usable < 1024:
+        usable = max(512, ctx // 4)
+    return int(usable * _CHARS_PER_TOKEN)
+
+
+def _fit_samples_to_budget(
+    samples_by_domain: dict[str, list[str]],
+    char_budget: int,
+    *,
+    min_per_domain: int = 2,
+) -> tuple[dict[str, list[str]], int, Optional[str]]:
+    """
+    Uřízne ukázky tak, aby se blok vešel do char_budget.
+
+    Nejdřív zkracuje náhled jednoho textu (600 → 400 → 300 → 200 → 120 znaků),
+    pak ubírá ukázky kolem dokola přes domény (každá si drží min_per_domain).
+    Vrací (ukázky, preview_chars, popis uříznutí nebo None).
+    """
+    def rendered_len(sm: dict[str, list[str]], cap: int) -> int:
+        _, block = _format_samples_for_prompt(sm, preview_chars=cap)
+        return len(block)
+
+    caps = [c for c in (CONFIG.taxonomy_sample_preview_chars, 400, 300, 200, 120)
+            if c <= CONFIG.taxonomy_sample_preview_chars] or [120]
+    n_before = sum(len(v) for v in samples_by_domain.values())
+
+    cur = {d: list(v) for d, v in samples_by_domain.items()}
+    cap = caps[0]
+    if rendered_len(cur, cap) <= char_budget:
+        return cur, cap, None
+
+    for c in caps:
+        cap = c
+        if rendered_len(cur, cap) <= char_budget:
+            return cur, cap, (
+                f"náhled ukázky zkrácen na {cap} znaků (kontext "
+                f"{CONFIG.extractor_context_len})"
+            )
+
+    # Ani nejkratší náhled nestačí → ubírej ukázky (od domén s nejvíc ukázkami).
+    while rendered_len(cur, cap) > char_budget:
+        biggest = max(cur, key=lambda d: len(cur[d]))
+        if len(cur[biggest]) <= min_per_domain:
+            break
+        cur[biggest].pop()
+    n_after = sum(len(v) for v in cur.values())
+    return cur, cap, (
+        f"prompt uříznut na kontext {CONFIG.extractor_context_len}: "
+        f"{n_after}/{n_before} ukázek, náhled {cap} znaků"
+    )
 
 
 def _collect_samples(
@@ -694,7 +855,26 @@ _MANDATORY_LABELS: dict[str, str] = {
 # Minimální počet labelů, které musí navrhnout SÁM LLM (před doplněním
 # povinných), aby se auto-taxonomie považovala za kvalitní. Pod tímto prahem
 # to vypadá, že model instrukci odbyl → reklamace + retry.
-_MIN_LLM_LABELS = 5
+#
+# Odvozeno z TAXONOMY_MIN_LABELS s tolerancí 3 pod instruovaným minimem:
+# prompt říká "aspoň MIN", brána reklamuje až pod MIN-3 (default 8-3=5 —
+# zachovává původní chování; brána nemá být přísnější než nutné, model
+# občas legitimně slije 1-2 kategorie). Podlaha 2 (míň nedává smysl).
+def min_llm_labels() -> int:
+    """
+    Kolik vlastních labelů musí LLM navrhnout, aby návrh prošel bránou.
+
+    Tolerance 3 pod TAXONOMY_MIN_LABELS — model občas legitimně slije
+    kategorie. 0 = brána na počet je vypnutá (TAXONOMY_MIN_LABELS=0).
+
+    Čte se za běhu, ne při importu, aby šlo hodnotu měnit v .env i v testech.
+    Úplně prázdný návrh projít nemůže ani s vypnutou bránou: parse odmítne
+    JSON bez 'labels'.
+    """
+    configured = CONFIG.taxonomy_min_labels
+    if configured <= 0:
+        return 0
+    return max(2, configured - 3)
 
 
 def _ensure_mandatory_labels(tax: Taxonomy) -> list[str]:
@@ -736,10 +916,11 @@ def _assess_taxonomy_quality(tax: Taxonomy, n_llm_labels: int) -> list[str]:
     povinných) — povinné labely doplněné SW se do kvality LLM nepočítají.
     """
     complaints: list[str] = []
-    if n_llm_labels < _MIN_LLM_LABELS:
+    min_labels = min_llm_labels()
+    if min_labels and n_llm_labels < min_labels:
         complaints.append(
             f"Navrhl jsi jen {n_llm_labels} vlastních labelů, což je málo — "
-            f"potřebuju aspoň {_MIN_LLM_LABELS} smysluplných NER kategorií, "
+            f"potřebuju aspoň {min_labels} smysluplných NER kategorií, "
             f"které pokrývají entity ve vzorcích (osoby, produkty, organizace, "
             f"místa, částky, data, …)."
         )
@@ -785,24 +966,52 @@ async def discover_taxonomy_auto(
             f"nelze spustit. Nejdřív tam dej JSON exporty."
         )
 
-    samples = _collect_samples(items, samples_per_dataset=samples_per_dataset, seed=seed)
+    # Fáze 0a: ukázky vybrané embeddingy (taxonomy_sampling.json), jinak
+    # náhodný výběr (best-effort — chybějící / zastaralý výběr běh nezastaví).
+    from .taxonomy_sampling import load_samples_for_discovery
+    emb_samples = load_samples_for_discovery(items)
+    if emb_samples is not None:
+        samples, sampling_note = emb_samples
+        counts = [len(v) for v in samples.values()] or [0]
+        per_domain_label = (
+            str(counts[0]) if min(counts) == max(counts)
+            else f"{min(counts)}–{max(counts)}"
+        )
+    else:
+        samples = _collect_samples(items, samples_per_dataset=samples_per_dataset, seed=seed)
+        sampling_note = f"náhodný výběr {samples_per_dataset}+3 kotvy per doména"
+        per_domain_label = str(samples_per_dataset)
     if not samples:
         raise ValueError("Žádné vzorky nelze sestavit (prázdné texty?)")
 
-    domains_block, samples_block = _format_samples_for_prompt(samples)
+    # Prompt musí sednout do kontextu serveru VČETNĚ místa na odpověď — jinak
+    # vrátí HTTP 400 a celá fáze 0 spadne na defaultních 16 kategorií.
+    completion_tokens = max(1024, min(max_tokens, CONFIG.taxonomy_max_tokens))
+    samples, preview_chars, trim_note = _fit_samples_to_budget(
+        samples, _prompt_char_budget(completion_tokens),
+    )
+    if trim_note:
+        logger.warning(f"taxonomy discovery: {trim_note}")
+        sampling_note = f"{sampling_note}; {trim_note}"
+
+    domains_block, samples_block = _format_samples_for_prompt(
+        samples, preview_chars=preview_chars,
+    )
     user_prompt = TAXONOMY_USER_TEMPLATE.format(
         domains_block=domains_block,
         samples_block=samples_block,
-        samples_per_dataset=samples_per_dataset,
+        samples_per_dataset=per_domain_label,
     )
 
     logger.info(
         f"taxonomy discovery: posílám LLM {sum(len(v) for v in samples.values())} "
-        f"ukázek z {len(samples)} domén: {sorted(samples.keys())}"
+        f"ukázek z {len(samples)} domén: {sorted(samples.keys())} "
+        f"(~{len(samples_block) // 1000} kB promptu, {completion_tokens} tokenů "
+        f"na odpověď, kontext {CONFIG.extractor_context_len})"
     )
 
     messages = [
-        {"role": "system", "content": TAXONOMY_SYSTEM_PROMPT},
+        {"role": "system", "content": taxonomy_system_prompt()},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -813,8 +1022,15 @@ async def discover_taxonomy_auto(
     last_complaints: list[str] = ["(žádný validní výstup)"]
     for attempt in range(1, max_attempts + 1):
         try:
+            # reasoning z CONFIG (TAXONOMY_REASONING, default ON) — thinking
+            # zlepšuje kvalitu navržené taxonomie; jde o jednorázová volání.
             resp = await extractor_client.chat(
-                messages, max_tokens=max_tokens, reasoning=False,
+                messages, max_tokens=completion_tokens,
+                reasoning=CONFIG.taxonomy_reasoning,
+                # Bez tohohle by llm_client s reasoning=True tlačil minimum
+                # 16384 tokenů na odpověď — s velkým promptem se to do
+                # kontextu nevejde (HTTP 400).
+                reasoning_max_tokens=completion_tokens,
             )
         except (LLMFatalError, LLMTransientError) as e:
             raise LLMFatalError(f"taxonomy discovery: LLM volání selhalo: {e}")
@@ -837,7 +1053,7 @@ async def discover_taxonomy_auto(
                 # === KVALITA OK — hotovo ===
                 tax.source_datasets = sorted(samples.keys())
                 tax.notes = (
-                    f"Auto-discovered z {samples_per_dataset} ukázek per doména "
+                    f"Auto-discovered ({sampling_note}) z {per_domain_label} ukázek per doména "
                     f"({sum(len(v) for v in samples.values())} celkem). LLM: "
                     f"{extractor_client.model}. Pokus {attempt}/{max_attempts}."
                 )
@@ -893,6 +1109,8 @@ class ConfusablePair:
     b: str
     score: float          # součet nejistoty přes zaměněné spany (vyšší = horší)
     support: int          # počet spanů, které tenhle pár zaměnily
+    # Který ruler pár našel: "llm" | "emb" | "both" (u combined ruleru).
+    sources: str = "llm"
 
 
 @dataclass
@@ -902,6 +1120,11 @@ class ConfusionReport:
     n_spans: int
     pairs: list[ConfusablePair] = field(default_factory=list)
     evidence: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    # Který ruler měření provedl: "llm" (self-consistency probe nad spany)
+    # nebo "embedding" (kosinová podobnost profilů tříd). Ovlivňuje výběr
+    # párů — u embedding ruleru nemá `support` význam (viz
+    # _select_confusable_pairs).
+    ruler: str = "llm"
 
 
 def _clamp01(x) -> float:
@@ -959,7 +1182,23 @@ def _aggregate_confusion(spans: list, valid_codes: set) -> ConfusionReport:
 def _select_confusable_pairs(
     report: ConfusionReport, max_pairs: int, min_support: int
 ) -> list[ConfusablePair]:
-    """Vybere nejzaměňovanější páry nad prahem podpory. Pure."""
+    """
+    Vybere nejzaměňovanější páry. Pure.
+
+    `min_support` (kolik spanů pár reálně zaměnilo) filtruje jen páry z LLM
+    probe — chrání před zostřováním na základě jednoho náhodného výskytu.
+    Embedding měření je DETERMINISTICKÉ a každá dvojice je změřena právě
+    jednou, takže u ní support nenese informaci a filtr se přeskakuje;
+    u combined ruleru se filtr aplikuje jen na páry, které našel POUZE LLM.
+    """
+    if report.ruler == "embedding":
+        return report.pairs[:max_pairs]
+    if report.ruler == "combined":
+        eligible = [
+            p for p in report.pairs
+            if p.sources != "llm" or p.support >= min_support
+        ]
+        return eligible[:max_pairs]
     eligible = [p for p in report.pairs if p.support >= min_support]
     return eligible[:max_pairs]
 
@@ -1072,7 +1311,13 @@ async def _measure_confusion(
         return ConfusionReport(score=0.0, n_spans=0)
     messages = _build_confusion_probe_messages(tax, snippets)
     try:
-        resp = await client.chat(messages, max_tokens=max_tokens, reasoning=False)
+        resp = await client.chat(
+            messages, max_tokens=max_tokens,
+            reasoning=CONFIG.taxonomy_reasoning,
+            # Strop i pro thinking trace — jinak llm_client s reasoning=True
+            # tlačí minimum 16384 a při těsném kontextu vrátí server HTTP 400.
+            reasoning_max_tokens=max(1024, min(max_tokens, CONFIG.taxonomy_max_tokens)),
+        )
     except (LLMFatalError, LLMTransientError) as e:
         logger.warning(f"audit: probe LLM volání selhalo ({e}); přeskakuji měření")
         return ConfusionReport(score=0.0, n_spans=0)
@@ -1086,6 +1331,133 @@ async def _measure_confusion(
         f"top páry={[(p.a, p.b, round(p.score, 2)) for p in report.pairs[:3]]}"
     )
     return report
+
+
+# ---- ①b Ruler přes EMBEDDINGY (Pilíř B) --------------------------------------
+# Deterministická a levná alternativa LLM probe: konfuze se měří kosinovou
+# podobností profilů tříd (labeler/taxonomy_embeddings.py). Výhody proti LLM
+# ruleru: žádné LLM volání na měření, nulový šum, řádově rychlejší → smyčka
+# může iterovat víc kol. Vyžaduje VOLITELNOU závislost sentence-transformers;
+# bez ní se `create_embedding_ruler` vrátí None a audit spadne na LLM ruler.
+
+
+def create_embedding_ruler():
+    """
+    Vytvoří stav embedding ruleru (drží backend, aby se model načetl JEN
+    JEDNOU napříč koly auditu). Vrátí None, když embeddingy nejsou dostupné
+    (chybí volitelná závislost / model) — volající pak použije LLM ruler.
+    """
+    try:
+        from .taxonomy_embeddings import (
+            TaxonomyEmbeddingConfig, _EmbeddingRulerState,
+        )
+        state = _EmbeddingRulerState(config=TaxonomyEmbeddingConfig.from_env())
+        state.ensure_backend()   # fail-fast: model se načte teď, ne uprostřed smyčky
+        return state
+    except Exception as e:  # noqa: BLE001 — volitelná závislost, best-effort
+        logger.warning(
+            f"audit: embedding ruler nedostupný ({type(e).__name__}: {e}) — "
+            f"použije se LLM ruler. Embeddingy vyžadují sentence-transformers "
+            f"(pip install -r requirements.txt) a stažitelný model "
+            f"TAXONOMY_EMBEDDING_MODEL."
+        )
+        return None
+
+
+def measure_confusion_embedding(ruler_state, tax: Taxonomy) -> ConfusionReport:
+    """
+    Ruler (Pilíř B): kosinová podobnost profilů tříd → matice konfuze.
+
+    Skóre je ABSOLUTNÍ (průměr podobností nejhorších dvojic), takže audit umí
+    porovnávat kola mezi sebou — percentilová metrika by byla samonormalizační
+    a zlepšení by nikdy nenaměřila.
+
+    `evidence` zůstává prázdná: embedding ruler nepracuje se spany z korpusu.
+    Zostřovací prompt má i tak k dispozici popisy a příklady obou tříd.
+    Best-effort — při chybě vrátí prázdný report (audit to bere jako 'neměřím').
+    """
+    try:
+        from .taxonomy_embeddings import measure_taxonomy_confusion
+        m = measure_taxonomy_confusion(
+            tax, ruler_state.config, ruler_state.ensure_backend(),
+        )
+    except Exception as e:  # noqa: BLE001 — měření je best-effort
+        logger.warning(f"audit: embedding měření selhalo ({e}); přeskakuji kolo")
+        return ConfusionReport(score=0.0, n_spans=0, ruler="embedding")
+
+    pairs = [
+        ConfusablePair(a=a, b=b, score=sim, support=1)
+        for a, b, sim, _z in m.pairs
+    ]
+    report = ConfusionReport(
+        score=m.score,
+        n_spans=len(pairs),      # u embeddingů = počet změřených dvojic
+        pairs=pairs,
+        evidence={},
+        ruler="embedding",
+    )
+    logger.info(
+        f"audit: embedding ruler změřil {len(pairs)} dvojic, "
+        f"konfuze={report.score:.3f}, nejhorší="
+        f"{[(p.a, p.b, round(p.score, 2)) for p in pairs[:3]]}"
+    )
+    return report
+
+
+# ---- ①c Kombinace obou rulerů (auto) -----------------------------------------
+
+
+def _combine_confusion_reports(
+    emb: Optional[ConfusionReport],
+    llm: Optional[ConfusionReport],
+    weight: float,
+) -> ConfusionReport:
+    """
+    Spojí embedding a LLM měření do jednoho reportu (ruler="combined").
+
+    Skóre = weight × embedding + (1 − weight) × LLM (obě jsou v 0-1: embedding
+    = průměrná podobnost nejbližších dvojic, LLM = průměrná nejistota top-1).
+
+    Páry: skóre každého ruleru se normalizuje jeho vlastním maximem (absolutní
+    hodnoty nejsou srovnatelné) a pak se sečtou stejnými vahami → pár, který
+    našly OBA rulery, má vyšší skóre než pár z jednoho. `sources` říká odkud
+    (emb / llm / both), `support` a `evidence` (reálně zaměněné výrazy pro
+    zostřovací prompt) přebíráme z LLM probe.
+
+    Když jedno měření chybí nebo nic nenaměřilo, vrací se druhé beze změny.
+    Pure — testovatelné bez LLM i bez embeddingů.
+    """
+    if emb is None or emb.n_spans == 0:
+        return llm if llm is not None else ConfusionReport(score=0.0, n_spans=0)
+    if llm is None or llm.n_spans == 0:
+        return emb
+    w = min(max(weight, 0.0), 1.0)
+
+    def _norm(pairs: list[ConfusablePair]) -> dict[tuple[str, str], float]:
+        top = max((p.score for p in pairs), default=0.0)
+        if top <= 0:
+            return {(p.a, p.b): 0.0 for p in pairs}
+        return {(p.a, p.b): p.score / top for p in pairs}
+
+    emb_norm, llm_norm = _norm(emb.pairs), _norm(llm.pairs)
+    llm_support = {(p.a, p.b): p.support for p in llm.pairs}
+    pairs: list[ConfusablePair] = []
+    for key in sorted(set(emb_norm) | set(llm_norm)):
+        in_emb, in_llm = key in emb_norm, key in llm_norm
+        pairs.append(ConfusablePair(
+            a=key[0], b=key[1],
+            score=w * emb_norm.get(key, 0.0) + (1 - w) * llm_norm.get(key, 0.0),
+            support=llm_support.get(key, 0),
+            sources="both" if in_emb and in_llm else ("emb" if in_emb else "llm"),
+        ))
+    pairs.sort(key=lambda p: (p.score, p.sources == "both", p.support), reverse=True)
+    return ConfusionReport(
+        score=w * emb.score + (1 - w) * llm.score,
+        n_spans=emb.n_spans + llm.n_spans,
+        pairs=pairs,
+        evidence=dict(llm.evidence),
+        ruler="combined",
+    )
 
 
 # ---- ③ Oprava (zostři) -------------------------------------------------------
@@ -1173,7 +1545,13 @@ async def _sharpen_pair(
         return 0
     messages = _build_sharpen_messages(la, lb, evidence)
     try:
-        resp = await client.chat(messages, max_tokens=max_tokens, reasoning=False)
+        resp = await client.chat(
+            messages, max_tokens=max_tokens,
+            reasoning=CONFIG.taxonomy_reasoning,
+            # Strop i pro thinking trace — jinak llm_client s reasoning=True
+            # tlačí minimum 16384 a při těsném kontextu vrátí server HTTP 400.
+            reasoning_max_tokens=max(1024, min(max_tokens, CONFIG.taxonomy_max_tokens)),
+        )
     except (LLMFatalError, LLMTransientError) as e:
         logger.warning(f"audit: zostření páru {pair.a}/{pair.b} selhalo ({e})")
         return 0
@@ -1253,30 +1631,95 @@ async def audit_and_refine_taxonomy(
     max_pairs: int = 2,
     min_support: int = 2,
     structural_edits: bool = False,
+    ruler: Optional[str] = None,
 ) -> Taxonomy:
     """
     Pilíř A / krok 2 — iterativně měří konfuzi taxonomie a zostřuje zaměňované
     páry. Vrací NEJLEPŠÍ (nejméně zaměňovanou) viděnou variantu; nikdy nevrátí
     horší taxonomii než na vstupu.
 
+    `ruler` volí METRIKU konfuze (default z TAXONOMY_AUDIT_RULER):
+      combined  — DEFAULT, OBOJÍ zároveň: embedding podobnost profilů tříd
+                  + LLM top-2 probe nad held-out spany; skóre i páry se spojí
+                  (TAXONOMY_AUDIT_EMBEDDING_WEIGHT). Když jedno není dostupné
+                  (chybí embeddingy / prázdný korpus), použije se druhé.
+      auto      — JEDNO z nich: embeddingy, když jsou dostupné, jinak LLM
+                  (původní chování)
+      embedding — jen embeddingy (bez nich fallback na LLM)
+      llm       — jen LLM top-2 self-consistency probe nad held-out spany
+
     Best-effort: chyby měření/zostření se logují a přeskakují, běh se nezastaví.
     """
-    items = list(scan_data_dir(CONFIG.data_dir))
-    if not items:
-        logger.info("audit: prázdný DATA_DIR — přeskakuji, vracím taxonomii beze změny")
-        return tax
+    ruler_name = (ruler or CONFIG.taxonomy_audit_ruler).strip().lower()
+    if ruler_name not in ("auto", "combined", "llm", "embedding"):
+        logger.warning(
+            f"audit: neznámý ruler {ruler_name!r} — používám 'combined'"
+        )
+        ruler_name = "combined"
+    combined = ruler_name == "combined"
+
+    # Embedding ruler potřebuje volitelnou závislost → rozhodnout PŘED smyčkou
+    # (a model načíst jen jednou).
+    embedding_ruler = None
+    if combined or ruler_name in ("auto", "embedding"):
+        embedding_ruler = create_embedding_ruler()
+        if embedding_ruler is None and ruler_name == "embedding":
+            logger.warning(
+                "audit: ruler=embedding vyžádán, ale embeddingy nejsou "
+                "dostupné — spadám na LLM ruler."
+            )
+    use_embedding = embedding_ruler is not None
+    # combined = obojí; auto/embedding = embeddingy, a LLM jen když nejsou.
+    use_llm = combined or ruler_name == "llm" or not use_embedding
+
+    # LLM probe sampluje held-out spany z korpusu; embedding pracuje jen
+    # s profily tříd, takže data nepotřebuje.
+    items: list = []
+    if use_llm:
+        items = list(scan_data_dir(CONFIG.data_dir))
+        if not items:
+            if not use_embedding:
+                logger.info(
+                    "audit: prázdný DATA_DIR — přeskakuji, vracím taxonomii beze změny"
+                )
+                return tax
+            logger.warning(
+                "audit: prázdný DATA_DIR — LLM probe se přeskočí, měřím jen embeddingy"
+            )
+            use_llm = False
+
+    ruler_used = (
+        "embedding+llm" if (use_embedding and use_llm)
+        else ("embedding" if use_embedding else "llm")
+    )
+    logger.info(
+        f"audit: ruler={ruler_used} (konfigurace: {ruler_name}"
+        + (f", váha embeddingů {CONFIG.taxonomy_audit_embedding_weight}"
+           if use_embedding and use_llm else "")
+        + ")"
+    )
 
     best = deepcopy(tax)
     best_score = float("inf")
     current = deepcopy(tax)
 
     for rnd in range(1, max_rounds + 1):
-        snippets = _heldout_snippets(
-            items, samples_per_dataset=samples_per_dataset, seed=seed + 101 * rnd,
+        emb_report = (
+            measure_confusion_embedding(embedding_ruler, current)
+            if use_embedding else None
         )
-        report = await _measure_confusion(client, current, snippets)
+        llm_report = None
+        if use_llm:
+            snippets = _heldout_snippets(
+                items, samples_per_dataset=samples_per_dataset,
+                seed=seed + 101 * rnd,
+            )
+            llm_report = await _measure_confusion(client, current, snippets)
+        report = _combine_confusion_reports(
+            emb_report, llm_report, CONFIG.taxonomy_audit_embedding_weight,
+        )
         if report.n_spans == 0:
-            logger.info(f"audit: kolo {rnd} nezměřilo žádné spany — končím")
+            logger.info(f"audit: kolo {rnd} nic nezměřilo — končím")
             break
 
         improved = report.score < best_score
@@ -1284,8 +1727,17 @@ async def audit_and_refine_taxonomy(
             best = deepcopy(current)
             best_score = report.score
 
+        detail = ""
+        if report.ruler == "combined":
+            detail = (
+                f" [embedding={emb_report.score:.3f}, llm={llm_report.score:.3f}, "
+                f"páry both/emb/llm="
+                f"{sum(1 for p in report.pairs if p.sources == 'both')}/"
+                f"{sum(1 for p in report.pairs if p.sources == 'emb')}/"
+                f"{sum(1 for p in report.pairs if p.sources == 'llm')}]"
+            )
         logger.info(
-            f"audit: kolo {rnd}/{max_rounds} konfuze={report.score:.3f} "
+            f"audit: kolo {rnd}/{max_rounds} konfuze={report.score:.3f}{detail} "
             f"(nejlepší={best_score:.3f}, {'zlepšení' if improved else 'bez zlepšení'})"
         )
 
@@ -1316,11 +1768,11 @@ async def audit_and_refine_taxonomy(
     prefix = (best.notes + " | ") if best.notes else ""
     if best_score == float("inf"):
         best.notes = prefix + (
-            "disjointness audit: nezměřeno (probe nevrátil spany) — beze změny."
+            f"disjointness audit ({ruler_used}): nezměřeno — beze změny."
         )
     else:
         best.notes = prefix + (
-            f"disjointness audit: konfuze={best_score:.3f} "
+            f"disjointness audit ({ruler_used}): konfuze={best_score:.3f} "
             f"(cíl {target_score}, max {max_rounds} kol)."
         )
     return best
@@ -1353,7 +1805,9 @@ async def run_taxonomy_discovery(
         if user_taxonomy_path is None:
             raise ValueError("USER mode vyžaduje --user-taxonomy <path>")
         tax = load_user_taxonomy(user_taxonomy_path)
-        return save_taxonomy(tax)
+        path = save_taxonomy(tax)
+        _run_embedding_analysis_best_effort(path)
+        return path
 
     # AUTO mode — potřebuje LLM.
     #
@@ -1377,6 +1831,7 @@ async def run_taxonomy_discovery(
                 max_concurrency=2,  # taxonomy je 1 request, ne hromadný
                 request_timeout=CONFIG.request_timeout_s,
                 max_retries=CONFIG.max_retries,
+                context_len=CONFIG.extractor_context_len,
             ) as client:
                 await client.wait_ready(max_wait_s=1200)
                 tax = await discover_taxonomy_auto(
@@ -1399,6 +1854,7 @@ async def run_taxonomy_discovery(
                             max_pairs=CONFIG.taxonomy_audit_max_pairs,
                             min_support=CONFIG.taxonomy_audit_min_support,
                             structural_edits=CONFIG.taxonomy_audit_structural_edits,
+                            ruler=CONFIG.taxonomy_audit_ruler,
                         )
                     except Exception as e:  # noqa: BLE001 — audit je best-effort
                         logger.warning(
@@ -1406,6 +1862,13 @@ async def run_taxonomy_discovery(
                             f"ponechávám taxonomii z návrhu (krok 1).",
                             exc_info=True,
                         )
+                # Fáze 0b — embeddingy vyberou zaměnitelné páry, LLM jim
+                # zostří hranice; výsledek JDE do entity_taxonomy.json.
+                if CONFIG.taxonomy_embedding_enabled:
+                    tax = await refine_taxonomy_with_embeddings(
+                        client, tax,
+                        max_pairs=CONFIG.taxonomy_embedding_refine_max_pairs,
+                    )
         except TaxonomyQualityError as e:
             # LLM nedodal kvalitní taxonomii ani po reklamaci + retry.
             logger.error(
@@ -1424,6 +1887,217 @@ async def run_taxonomy_discovery(
                 exc_info=True,
             )
             return None
-        return save_taxonomy(tax)
+        path = save_taxonomy(tax)
+        _run_embedding_analysis_best_effort(path)
+        return path
 
     raise ValueError(f"Neznámý taxonomy mode: {mode!r}")
+
+
+def _run_embedding_analysis_best_effort(tax_path: Path) -> None:
+    """
+    Fáze 0b — embedding analýza právě uložené taxonomie (TAXONOMY_EMBEDDING_
+    ENABLED, default ON). Běží AUTOMATICKY všude, kde vzniká taxonomie
+    (příkazy taxonomy / extract / pipeline i smoke-test --phase taxonomy),
+    protože všechny procházejí run_taxonomy_discovery. Reporty se zapíšou
+    vedle taxonomie a výsledky (zaměnitelné / disjunktní třídy, clustery) se
+    ZAPÍŠOU DO entity_taxonomy.json. BEST-EFFORT: selhání zaloguje warning,
+    taxonomie platí.
+    """
+    if not CONFIG.taxonomy_embedding_enabled:
+        return
+    try:
+        from .taxonomy_embeddings import (
+            TaxonomyEmbeddingConfig, run_taxonomy_embedding_analysis,
+        )
+        report = run_taxonomy_embedding_analysis(
+            tax_path, tax_path.parent, TaxonomyEmbeddingConfig.from_env(),
+        )
+        tax = Taxonomy.from_dict(json.loads(tax_path.read_text(encoding="utf-8")))
+        annotate_taxonomy_with_embeddings(tax, report)
+        atomic_write_json(tax_path, tax.to_dict())
+        logger.info(
+            f"Fáze 0b: embedding analýza hotová, vztahy tříd zapsány do {tax_path}"
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort, taxonomie už je uložená
+        logger.warning(
+            f"Fáze 0b: embedding analýza taxonomie selhala "
+            f"({type(e).__name__}: {e}) — taxonomie zůstává platná."
+        )
+
+
+_EMB_CONFUSABLE = ("possible_duplicate", "possible_overlap")
+_EMB_DISJOINT = "disjoint_candidate"
+
+
+def annotate_taxonomy_with_embeddings(tax: Taxonomy, report) -> None:
+    """
+    Zapíše výsledky embedding analýzy do taxonomie (pure, in-place):
+      label.confusable_with      partneři s possible_duplicate/possible_overlap,
+                                 seřazení od nejpodobnějšího
+      label.disjoint_candidates  partneři s disjoint_candidate (abecedně)
+      label.embedding_cluster    id clusteru
+      tax.embedding_analysis     souhrn (model, distribuce, počty párů)
+    `report` je TaxonomyEmbeddingReport (nebo objekt se stejnými atributy).
+    """
+    by_code = {lb.code: lb for lb in tax.labels}
+    confusable: dict[str, list[tuple[float, str]]] = {c: [] for c in by_code}
+    disjoint: dict[str, list[str]] = {c: [] for c in by_code}
+    for pr in report.pairs:
+        a, b = pr.class_a, pr.class_b
+        if a not in by_code or b not in by_code:
+            continue
+        if pr.classification in _EMB_CONFUSABLE:
+            confusable[a].append((pr.cosine_similarity, b))
+            confusable[b].append((pr.cosine_similarity, a))
+        elif pr.classification == _EMB_DISJOINT:
+            disjoint[a].append(b)
+            disjoint[b].append(a)
+    cluster_of = {
+        code: c.cluster_id for c in report.clusters for code in c.labels
+    }
+    for code, lb in by_code.items():
+        ranked = sorted(confusable[code], key=lambda t: (-t[0], t[1]))
+        lb.confusable_with = [other for _sim, other in ranked]
+        lb.disjoint_candidates = sorted(disjoint[code])
+        lb.embedding_cluster = int(cluster_of.get(code, -1))
+    dist = getattr(report, "similarity_distribution", None)
+    summary = getattr(report, "summary", None)
+    tax.embedding_analysis = {
+        "model": report.model,
+        "method": getattr(report, "method", ""),
+        "centered": getattr(report, "centered", None),
+        "threshold_mode": getattr(report, "threshold_mode", ""),
+        "similarity_distribution": dist.model_dump() if dist is not None else None,
+        "summary": summary.model_dump() if summary is not None else None,
+        "formal_disjointness_proof": False,
+    }
+
+
+def _merge_refinement(
+    tax: Taxonomy, refined: list, pair: tuple[str, str],
+    rules: dict[str, list[str]], described: set[str],
+) -> int:
+    """
+    Zapracuje zostření jednoho páru tak, aby se výsledky VÍCE párů u téže třídy
+    NEPŘEPISOVALY: popis bere první (nejpodobnější) pár, hraniční pravidla se
+    sčítají, counter_examples se sjednocují. Kódy mimo `pair` ignoruje.
+    Pure — vrací počet upravených labelů.
+    """
+    by_code = {lb.code.upper(): lb for lb in tax.labels}
+    allowed = {pair[0].upper(), pair[1].upper()}
+    changed = 0
+    for r in refined:
+        if not isinstance(r, dict):
+            continue
+        code = str(r.get("code") or "").strip().upper()
+        lb = by_code.get(code)
+        if lb is None or code not in allowed:
+            continue
+        touched = False
+        desc = str(r.get("description") or "").strip()
+        if code not in described and len(desc) >= 10 and desc != lb.description:
+            lb.description = desc
+            described.add(code)
+            touched = True
+        rule = str(r.get("decision_rule") or "").strip()
+        if rule and rule not in rules.setdefault(code, []):
+            rules[code].append(rule)
+            touched = True
+        for ce in (r.get("counter_examples") or []):
+            ce = str(ce).strip()
+            if ce and ce not in lb.counter_examples:
+                lb.counter_examples.append(ce)
+                touched = True
+        changed += int(touched)
+    return changed
+
+
+async def refine_taxonomy_with_embeddings(
+    client, tax: Taxonomy, *, max_pairs: int = 10, max_tokens: int = 4096,
+) -> Taxonomy:
+    """
+    Fáze 0b / zostření řízené embeddingy — embeddingy ovlivní VÝSLEDNOU
+    taxonomii:
+
+      1. embedding analýza označí zaměnitelné páry tříd
+         (possible_duplicate / possible_overlap, od nejpodobnějšího),
+      2. LLM každému páru (max `max_pairs`) zostří description,
+         decision_rule a counter_examples — pravidla třídy z více párů se
+         SČÍTAJÍ, nepřepisují,
+      3. výsledek se přijme BEZ embeddingové brány (profil pro embedding
+         pravidla ani counter_examples neobsahuje, brána by je nespravedlivě
+         zahodila); pojistkou je validita taxonomie.
+
+    Třídy se NESLUČUJÍ — embeddingy občas označí jako "duplicitu" i zjevně
+    různé třídy (např. MISTO × OSOBA), sloučení by bylo destruktivní.
+    BEST-EFFORT: bez embeddingů nebo při chybě vrátí vstup beze změny.
+    """
+    if max_pairs <= 0:
+        return tax
+    try:
+        import tempfile
+        from .taxonomy_embeddings import (
+            TaxonomyEmbeddingConfig, run_taxonomy_embedding_analysis,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp) / "entity_taxonomy.json"
+            atomic_write_json(tmp_path, tax.to_dict())
+            report = run_taxonomy_embedding_analysis(
+                tmp_path, Path(tmp), TaxonomyEmbeddingConfig.from_env(),
+            )
+    except Exception as e:  # noqa: BLE001 — embeddingy jsou best-effort
+        logger.warning(
+            f"Fáze 0b: embedding zostření přeskočeno — analýza selhala "
+            f"({type(e).__name__}: {e})"
+        )
+        return tax
+
+    flagged = sorted(
+        (p for p in report.pairs if p.classification in _EMB_CONFUSABLE),
+        key=lambda p: (-p.cosine_similarity, p.class_a, p.class_b),
+    )[:max_pairs]
+    if not flagged:
+        logger.info("Fáze 0b: embeddingy nenašly zaměnitelné páry — beze změny")
+        return tax
+
+    refined = deepcopy(tax)
+    by_code = {lb.code.upper(): lb for lb in refined.labels}
+    rules: dict[str, list[str]] = {}
+    described: set[str] = set()
+    sharpened = 0
+    for p in flagged:
+        la, lb = by_code.get(p.class_a.upper()), by_code.get(p.class_b.upper())
+        if la is None or lb is None:
+            continue
+        messages = _build_sharpen_messages(la, lb, [])
+        try:
+            resp = await client.chat(
+                messages, max_tokens=max_tokens,
+                reasoning=CONFIG.taxonomy_reasoning,
+                reasoning_max_tokens=max(
+                    1024, min(max_tokens, CONFIG.taxonomy_max_tokens)
+                ),
+            )
+        except (LLMFatalError, LLMTransientError) as e:
+            logger.warning(f"Fáze 0b: zostření {p.class_a}/{p.class_b} selhalo ({e})")
+            continue
+        out = _extract_json_list(resp.content, resp.parsed, "labels", "Labels")
+        if _merge_refinement(refined, out, (p.class_a, p.class_b), rules, described):
+            sharpened += 1
+            logger.info(
+                f"Fáze 0b: zostřen pár {p.class_a}/{p.class_b} "
+                f"({p.classification}, podobnost {p.cosine_similarity:.2f})"
+            )
+    for code, rs in rules.items():
+        by_code[code].decision_rule = " ".join(rs)
+
+    if refined.validate():
+        logger.warning("Fáze 0b: zostření rozbilo validitu taxonomie — ponechávám vstup")
+        return tax
+    prefix = (refined.notes + " | ") if refined.notes else ""
+    refined.notes = prefix + (
+        f"embedding zostření: {sharpened}/{len(flagged)} zaměnitelných párů "
+        f"(model {report.model})."
+    )
+    return refined

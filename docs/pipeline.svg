@@ -1,0 +1,216 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 900" width="1180" height="900" role="img" aria-label="Schéma labelovací pipeline: fáze 0a sample, 0 taxonomy, 1 extract, 2 critic, 2b revise, 3 finalize">
+  <title>LLM NER/RE annotator — schéma labelovací pipeline</title>
+  <desc>Fáze 0a (výběr ukázek přes embeddingy), 0 (návrh taxonomie + audit), 1 (extrakce NER/RE), 2 (critic), 2b (revise), 3 (finalize). Na GPU je vždy jen jeden model.</desc>
+
+  <style>
+    :root { color-scheme: light dark; }
+    .bg      { fill: #ffffff; }
+    .title   { fill: #0f172a; font: 700 23px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .sub     { fill: #64748b; font: 400 13px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .phase   { fill: #f1f5f9; stroke: #cbd5e1; }
+    .phase-h { fill: #e2e8f0; }
+    .gpu     { fill: #eef2ff; stroke: #a5b4fc; }
+    .cpu     { fill: #ecfdf5; stroke: #6ee7b7; }
+    .art     { fill: #fffbeb; stroke: #fcd34d; }
+    .io      { fill: #f8fafc; stroke: #94a3b8; }
+    .ph-lbl  { fill: #1e293b; font: 700 15px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .ph-name { fill: #334155; font: 600 13.5px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .body    { fill: #475569; font: 400 12px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .mono    { fill: #475569; font: 400 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .mono-b  { fill: #1e293b; font: 600 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .badge   { fill: #4338ca; font: 600 11px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .badge-c { fill: #047857; font: 600 11px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .flow    { stroke: #64748b; stroke-width: 1.8; fill: none; }
+    .flow-d  { stroke: #b45309; stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+    .note    { fill: #92400e; font: 400 11.5px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .legend  { fill: #475569; font: 400 11.5px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+
+    @media (prefers-color-scheme: dark) {
+      .bg      { fill: #0b1220; }
+      .title   { fill: #f1f5f9; }
+      .sub     { fill: #94a3b8; }
+      .phase   { fill: #15213a; stroke: #334155; }
+      .phase-h { fill: #1e2b48; }
+      .gpu     { fill: #1b2550; stroke: #6366f1; }
+      .cpu     { fill: #0f2e26; stroke: #10b981; }
+      .art     { fill: #2a2112; stroke: #b45309; }
+      .io      { fill: #121a2b; stroke: #64748b; }
+      .ph-lbl  { fill: #e2e8f0; }
+      .ph-name { fill: #cbd5e1; }
+      .body    { fill: #94a3b8; }
+      .mono    { fill: #94a3b8; }
+      .mono-b  { fill: #e2e8f0; }
+      .badge   { fill: #a5b4fc; }
+      .badge-c { fill: #6ee7b7; }
+      .flow    { stroke: #94a3b8; }
+      .flow-d  { stroke: #fbbf24; }
+      .note    { fill: #fbbf24; }
+      .legend  { fill: #94a3b8; }
+    }
+  </style>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1180" height="900"/>
+
+  <text class="title" x="40" y="46">LLM NER/RE annotator — labelovací pipeline</text>
+  <text class="sub" x="40" y="68">Fáze běží sekvenčně: na GPU je vždy jen jeden model. Každá fáze má checkpoint, takže se dá spustit samostatně (<tspan class="mono">from-extract</tspan> atd.).</text>
+
+  <!-- VSTUP -->
+  <rect class="io" x="40" y="96" width="250" height="88" rx="8"/>
+  <text class="ph-name" x="56" y="120">Vstup — Stage exporty</text>
+  <text class="mono" x="56" y="140">DATA_DIR/*.json  (v1 i v2)</text>
+  <text class="body" x="56" y="158">locale filtr: DATA_LOCALES=cs</text>
+  <text class="body" x="56" y="174">chunking + kontext per item</text>
+
+  <!-- FÁZE 0a -->
+  <rect class="phase" x="40" y="212" width="250" height="150" rx="8"/>
+  <rect class="phase-h" x="40" y="212" width="250" height="30" rx="8"/>
+  <rect class="phase-h" x="40" y="232" width="250" height="10"/>
+  <text class="ph-lbl" x="56" y="233">0a · SAMPLE</text>
+  <text class="badge" x="215" y="233">GPU</text>
+  <rect class="gpu" x="56" y="252" width="218" height="34" rx="6"/>
+  <text class="mono-b" x="66" y="266">BAAI/bge-m3</text>
+  <text class="body" x="66" y="280">vLLM, port 8002 (embeddingy)</text>
+  <text class="body" x="56" y="306">farthest-point témata přes celý</text>
+  <text class="body" x="56" y="322">dataset, šum se nevybírá,</text>
+  <text class="body" x="56" y="338">zástupce = nejtypičtější text</text>
+  <text class="body" x="56" y="354">počet: auto podle pokrytí</text>
+
+  <!-- FÁZE 0 -->
+  <rect class="phase" x="330" y="212" width="290" height="150" rx="8"/>
+  <rect class="phase-h" x="330" y="212" width="290" height="30" rx="8"/>
+  <rect class="phase-h" x="330" y="232" width="290" height="10"/>
+  <text class="ph-lbl" x="346" y="233">0 · TAXONOMY</text>
+  <text class="badge" x="545" y="233">GPU</text>
+  <rect class="gpu" x="346" y="252" width="258" height="34" rx="6"/>
+  <text class="mono-b" x="356" y="266">Qwen3.5-122B-A10B</text>
+  <text class="body" x="356" y="280">extractor LLM · reasoning ON</text>
+  <text class="body" x="346" y="306">návrh labelů → kvalitativní brána</text>
+  <text class="body" x="346" y="322">(reklamace + retry)</text>
+  <text class="body" x="346" y="338">audit disjointnosti: embeddingy + LLM</text>
+  <text class="body" x="346" y="354">0b: zostření zaměnitelných párů</text>
+
+  <!-- FÁZE 1 -->
+  <rect class="phase" x="660" y="212" width="250" height="150" rx="8"/>
+  <rect class="phase-h" x="660" y="212" width="250" height="30" rx="8"/>
+  <rect class="phase-h" x="660" y="232" width="250" height="10"/>
+  <text class="ph-lbl" x="676" y="233">1 · EXTRACT</text>
+  <text class="badge" x="835" y="233">GPU</text>
+  <rect class="gpu" x="676" y="252" width="218" height="34" rx="6"/>
+  <text class="mono-b" x="686" y="266">Qwen3.5-122B-A10B</text>
+  <text class="body" x="686" y="280">split: NER → RE</text>
+  <text class="body" x="676" y="306">entity podle taxonomie,</text>
+  <text class="body" x="676" y="322">pak relace nad potvrzenými</text>
+  <text class="body" x="676" y="338">entitami</text>
+  <text class="body" x="676" y="354">hash cache přeskočí duplicity</text>
+
+  <!-- FÁZE 2 -->
+  <rect class="phase" x="660" y="470" width="250" height="150" rx="8"/>
+  <rect class="phase-h" x="660" y="470" width="250" height="30" rx="8"/>
+  <rect class="phase-h" x="660" y="490" width="250" height="10"/>
+  <text class="ph-lbl" x="676" y="491">2 · CRITIC</text>
+  <text class="badge" x="835" y="491">GPU</text>
+  <rect class="gpu" x="676" y="510" width="218" height="34" rx="6"/>
+  <text class="mono-b" x="686" y="524">Gemma 4 31B</text>
+  <text class="body" x="686" y="538">sám na GPU · reasoning ON</text>
+  <text class="body" x="676" y="564">validace entit, pak relací</text>
+  <text class="body" x="676" y="580">(split NER/RE)</text>
+  <text class="body" x="676" y="596">verdikt: ok / revised / reject</text>
+  <text class="body" x="676" y="612">povolené kategorie = taxonomie</text>
+
+  <!-- FÁZE 2b -->
+  <rect class="phase" x="330" y="470" width="290" height="150" rx="8"/>
+  <rect class="phase-h" x="330" y="470" width="290" height="30" rx="8"/>
+  <rect class="phase-h" x="330" y="490" width="290" height="10"/>
+  <text class="ph-lbl" x="346" y="491">2b · REVISE</text>
+  <text class="badge" x="545" y="491">GPU</text>
+  <rect class="gpu" x="346" y="510" width="258" height="34" rx="6"/>
+  <text class="mono-b" x="356" y="524">Qwen3.5-122B-A10B</text>
+  <text class="body" x="356" y="538">revisor · jen non-ok kritiky</text>
+  <text class="body" x="346" y="564">přezkoumá výhrady critica a buď</text>
+  <text class="body" x="346" y="580">opraví, nebo trvá na původním</text>
+  <text class="body" x="346" y="596">výstupu → extractor_revised</text>
+  <text class="body" x="346" y="612">povolené kategorie = taxonomie</text>
+
+  <!-- FÁZE 3 -->
+  <rect class="phase" x="40" y="470" width="250" height="150" rx="8"/>
+  <rect class="phase-h" x="40" y="470" width="250" height="30" rx="8"/>
+  <rect class="phase-h" x="40" y="490" width="250" height="10"/>
+  <text class="ph-lbl" x="56" y="491">3 · FINALIZE</text>
+  <text class="badge-c" x="235" y="491">CPU</text>
+  <rect class="cpu" x="56" y="510" width="218" height="34" rx="6"/>
+  <text class="mono-b" x="66" y="524">bez LLM</text>
+  <text class="body" x="66" y="538">deterministické zpracování</text>
+  <text class="body" x="56" y="564">výběr nejlepší verze grafu,</text>
+  <text class="body" x="56" y="580">normalizace, dopočet pozic,</text>
+  <text class="body" x="56" y="596">lemmatizace, oddělení keyphrase</text>
+  <text class="body" x="56" y="612">(relace zůstávají)</text>
+
+  <!-- ARTEFAKTY -->
+  <rect class="art" x="40" y="390" width="250" height="52" rx="6"/>
+  <text class="mono" x="56" y="410">checkpoints/</text>
+  <text class="mono-b" x="56" y="428">taxonomy_sampling.json</text>
+
+  <rect class="art" x="330" y="390" width="290" height="52" rx="6"/>
+  <text class="mono" x="346" y="410">checkpoints/</text>
+  <text class="mono-b" x="346" y="428">entity_taxonomy.json</text>
+
+  <rect class="art" x="660" y="390" width="250" height="52" rx="6"/>
+  <text class="mono" x="676" y="410">checkpoints/</text>
+  <text class="mono-b" x="676" y="428">extractions.jsonl</text>
+
+  <rect class="art" x="330" y="648" width="290" height="52" rx="6"/>
+  <text class="mono" x="346" y="668">checkpoints/</text>
+  <text class="mono-b" x="346" y="686">critic_results.jsonl  (+ revised)</text>
+
+  <rect class="art" x="40" y="648" width="250" height="86" rx="6"/>
+  <text class="mono" x="56" y="668">checkpoints/</text>
+  <text class="mono-b" x="56" y="686">final_labels.json / .jsonl</text>
+  <text class="mono" x="56" y="704">stats.json</text>
+  <text class="mono" x="56" y="722">core_ner / keyphrases / re</text>
+
+  <!-- TOKY -->
+  <path class="flow" d="M 165 184 V 206" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 165 362 V 384" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 290 416 H 310 V 300 H 324" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 475 362 V 384" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 620 416 H 640 V 300 H 654" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 785 362 V 384" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 785 442 V 464" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 785 620 V 642 H 630" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 475 648 V 626" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 330 674 H 296" marker-end="url(#arrow)"/>
+  <path class="flow" d="M 165 620 V 642" marker-end="url(#arrow)"/>
+
+  <!-- vstupni texty do extract / critic -->
+  <path class="flow" d="M 165 212 V 196 H 700 V 206" marker-end="url(#arrow)" opacity="0.45"/>
+  <text class="body" x="400" y="192" opacity="0.75">původní text jde do každé LLM fáze</text>
+
+  <!-- TAXONOMIE DO VŠECH FÁZÍ (to, co bylo rozbité) -->
+  <path class="flow-d" d="M 500 442 V 456 H 940 V 470" marker-end="url(#arrow)"/>
+  <path class="flow-d" d="M 940 470 V 545 H 916" marker-end="url(#arrow)"/>
+  <path class="flow-d" d="M 475 442 V 462" marker-end="url(#arrow)"/>
+  <text class="note" x="952" y="440">entity_taxonomy.json</text>
+  <text class="note" x="952" y="458">= jediný povolený</text>
+  <text class="note" x="952" y="476">slovník kategorií</text>
+  <text class="note" x="952" y="494">pro extract, critic</text>
+  <text class="note" x="952" y="512">i revise</text>
+
+  <!-- LEGENDA -->
+  <rect class="io" x="40" y="776" width="1100" height="86" rx="8"/>
+  <rect class="gpu" x="60" y="796" width="16" height="16" rx="3"/>
+  <text class="legend" x="84" y="809">fáze s LLM na GPU (sekvenčně, jeden model v čase)</text>
+  <rect class="cpu" x="400" y="796" width="16" height="16" rx="3"/>
+  <text class="legend" x="424" y="809">fáze bez GPU</text>
+  <rect class="art" x="580" y="796" width="16" height="16" rx="3"/>
+  <text class="legend" x="604" y="809">checkpoint na disku (resumovatelné)</text>
+  <path class="flow-d" d="M 880 804 H 912" marker-end="url(#arrow)"/>
+  <text class="legend" x="920" y="809">taxonomie jako povolený slovník</text>
+  <text class="legend" x="60" y="836">Backendy: SGLang primárně, vLLM záloha (EXTRACTOR_BACKENDS / CRITIC_BACKENDS / REVISE_BACKENDS). Embedding server fáze 0a jede vždy na vLLM.</text>
+  <text class="legend" x="60" y="854">HW presety: B200 a RTX PRO 6000 → NVFP4 · A100 40 GB → INT4 (W4A16) u extraktoru, bf16 critic. Když fáze 0 selže, pipeline pokračuje s 16 defaultními kategoriemi.</text>
+</svg>

@@ -215,7 +215,8 @@ async def extract_graph_split(
 
 
 async def critique_split(
-    client: LLMClient, extraction: ExtractorResult, *, max_tokens: int
+    client: LLMClient, extraction: ExtractorResult, *, max_tokens: int,
+    taxonomy=None,
 ) -> Optional[CriticResult]:
     """Critic split — NER NEJDŘÍV, pak RE (s entitami, jak je vyhodnotil NER
     krok, jako kontextem). Merge do jednoho CriticResult (formát beze změny;
@@ -238,7 +239,7 @@ async def critique_split(
     # 1) NER critic NEJDŘÍV — validuje/opraví entity.
     ner_parsed, ner_resp = await _call_json(
         client,
-        build_critic_ner_messages(text, orig_entities, ctx),
+        build_critic_ner_messages(text, orig_entities, ctx, taxonomy),
         max_tokens,
         CONFIG.critic_reasoning,
         item_id=extraction.item_id,
@@ -356,6 +357,7 @@ async def revise_split(
     *,
     max_tokens: int,
     reasoning: bool,
+    taxonomy=None,
 ) -> Optional[CriticResult]:
     """Revise split — NER NEJDŘÍV, pak RE (s NER-revidovanými entitami jako
     kontextem). Sestaví extractor_revised. Vrací updated CriticResult, nebo
@@ -384,7 +386,7 @@ async def revise_split(
         client,
         build_revision_ner_messages(
             text, orig_entities, critic_result.status, critic_result.reasoning,
-            corr_entities, ctx,
+            corr_entities, ctx, taxonomy,
         ),
         CONFIG.extractor_ner_max_tokens,
         reasoning,

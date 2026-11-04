@@ -129,6 +129,82 @@ class LLMFatalError(LLMError):
     """Chyba, kterou nemá smysl opakovat (400, validace)."""
 
 
+class LLMPromptTooLong(LLMFatalError):
+    """Prompt sám nenechá v kontextu rozumné místo na odpověď.
+
+    Volající ji odchytí jako každou fatální chybu (item se přeskočí a ponechá
+    se předchozí výsledek) — ale NEPOŠLE request, který by stejně skončil
+    HTTP 400 "Requested token count exceeds the model's maximum context length".
+    """
+
+
+# Hrubý převod znaků na tokeny. Qwen/Gemma tokenizer dělá u české diakritiky
+# ~2,5–3 znaky na token; 2.5 je konzervativní (radši podcenit volné místo, než
+# poslat request, který server odmítne).
+CHARS_PER_TOKEN = 2.5
+
+# Rezerva na chat template, role, oddělovače a nepřesnost odhadu.
+CONTEXT_RESERVE_TOKENS = 512
+
+# Pod tuhle hranici nemá smysl odpověď zkracovat — JSON by se stejně usekl.
+MIN_COMPLETION_TOKENS = 1024
+
+
+# Server v 400 odpovědi pošle přesná čísla, např.:
+#   "maximum context length of 32768 tokens. You requested a total of 39011
+#    tokens: 14435 tokens from the input messages and 24576 tokens for the
+#    completion."
+# Z toho se dá budget dopočítat PŘESNĚ — bez odhadu přes znaky. Používáme to
+# jako samoopravu: když se odhad netrefil (jiný tokenizer, jiný kontext na
+# serveru, než je v .env), jeden retry to srovná.
+_CTX_LIMIT_RE = re.compile(r"maximum context length of (\d+)\s*tokens", re.I)
+_CTX_INPUT_RE = re.compile(r"(\d+)\s*tokens from the input messages", re.I)
+
+
+def exact_completion_from_error(body: str) -> Optional[tuple[int, int]]:
+    """Z chybové hlášky serveru vrátí (kontext, tokeny promptu), nebo None."""
+    lim = _CTX_LIMIT_RE.search(body or "")
+    inp = _CTX_INPUT_RE.search(body or "")
+    if not lim or not inp:
+        return None
+    return int(lim.group(1)), int(inp.group(1))
+
+
+def estimate_prompt_tokens(messages: list[dict]) -> int:
+    """Hrubý odhad délky promptu v tokenech (bez tokenizeru, viz CHARS_PER_TOKEN)."""
+    chars = 0
+    for m in messages:
+        content = m.get("content") or ""
+        if isinstance(content, str):
+            chars += len(content)
+        else:  # multimodální content (list částí) — sečti textové části
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chars += len(part["text"])
+    return int(chars / CHARS_PER_TOKEN) + 8 * len(messages)
+
+
+def fit_completion_tokens(
+    messages: list[dict],
+    requested: int,
+    context_len: Optional[int],
+) -> tuple[int, int]:
+    """
+    Vrátí (povolený počet tokenů odpovědi, odhad promptu v tokenech).
+
+    Když se `requested` do kontextu nevejde, zkrátí ho na zbylé místo. Když
+    nezbývá ani MIN_COMPLETION_TOKENS, vrátí 0 → request se nemá vůbec poslat.
+    `context_len` None/0 = kontext neznáme → nic neomezujeme (chování jako dřív).
+    """
+    prompt_tokens = estimate_prompt_tokens(messages)
+    if not context_len:
+        return requested, prompt_tokens
+    room = context_len - prompt_tokens - CONTEXT_RESERVE_TOKENS
+    if room < MIN_COMPLETION_TOKENS:
+        return 0, prompt_tokens
+    return min(requested, room), prompt_tokens
+
+
 @dataclass
 class LLMResponse:
     content: str
@@ -162,10 +238,15 @@ class LLMClient:
         request_timeout: float = 300.0,
         max_retries: int = 5,
         api_key: str = "not-needed",
+        context_len: Optional[int] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.max_retries = max_retries
+        self._max_concurrency = max(1, max_concurrency)
+        # Kontext serveru (--context-length / --max-model-len). Když ho známe,
+        # chat() ořízne max_tokens tak, aby se prompt + odpověď vešly.
+        self.context_len = context_len or None
         self._sem = asyncio.Semaphore(max_concurrency)
         self._timeout = request_timeout
         self._headers = {
@@ -175,9 +256,17 @@ class LLMClient:
         self._client: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self) -> "LLMClient":
+        # Limity POOLU MUSÍ být nad max_concurrency, jinak se requesty hromadí
+        # v httpx a na server vūbec nedojdou — server pak hlásí prázdnou
+        # frontu, i když klient "poslá" 128 requestů. Keepalive = tolik, kolik
+        # jich jede, ať se spojení neotevírají znovu pro každý request.
+        pool = max(16, self._max_concurrency + 8)
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self._timeout, connect=30.0),
-            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+            limits=httpx.Limits(
+                max_connections=pool,
+                max_keepalive_connections=max(8, self._max_concurrency),
+            ),
         )
         return self
 
@@ -219,6 +308,7 @@ class LLMClient:
         seed: Optional[int] = 42,
         reasoning: bool = False,
         repetition_penalty: Optional[float] = None,
+        reasoning_max_tokens: Optional[int] = None,
     ) -> LLMResponse:
         """
         Zavolá chat completion s retry a parse JSON.
@@ -252,7 +342,10 @@ class LLMClient:
             # Reasoning vyžaduje hodně prostoru pro thinking trace + finální JSON.
             # 16k je velkorysé — kritik s tímto budgetem má pohodlí i pro
             # nejsložitější validace s detailním zdůvodněním a opraveným grafem.
-            payload["max_tokens"] = max(max_tokens, 16384)
+            # Volající, kterému se do kontextu 16k nevejde (velký prompt fáze 0),
+            # si tenhle floor sníží přes reasoning_max_tokens.
+            floor = 16384 if reasoning_max_tokens is None else reasoning_max_tokens
+            payload["max_tokens"] = max(max_tokens, floor)
         else:
             # KRITICKÉ: Qwen3 chat template má enable_thinking DEFAULTNĚ ON.
             # Bez explicitního vypnutí model i v "ne-reasoning" režimu (extractor
@@ -265,7 +358,29 @@ class LLMClient:
             # odstraní a sjednotí chování napříč velikostí dávky.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
 
+        # Prompt + odpověď se MUSÍ vejít do kontextu serveru, jinak vrátí
+        # HTTP 400 "Requested token count exceeds the model's maximum context
+        # length". Ořízneme odpověď na zbylé místo; když nezbývá ani minimum,
+        # request vůbec neposíláme (volající item přeskočí a ponechá původní
+        # výsledek — to je pořád lepší než spálený request a chyba v logu).
+        allowed, prompt_tokens = fit_completion_tokens(
+            messages, int(payload["max_tokens"]), self.context_len
+        )
+        if allowed == 0:
+            raise LLMPromptTooLong(
+                f"prompt ~{prompt_tokens} tokenů se nevejde do kontextu "
+                f"{self.context_len} (zbylo by méně než {MIN_COMPLETION_TOKENS} "
+                f"tokenů na odpověď) — request neodeslán"
+            )
+        if allowed < int(payload["max_tokens"]):
+            logger.warning(
+                f"max_tokens {payload['max_tokens']} → {allowed} "
+                f"(prompt ~{prompt_tokens} tokenů, kontext {self.context_len})"
+            )
+            payload["max_tokens"] = allowed
+
         last_exc: Optional[Exception] = None
+        context_retry_done = False
         for attempt in range(self.max_retries + 1):
             async with self._sem:
                 t0 = time.monotonic()
@@ -279,6 +394,25 @@ class LLMClient:
                     if r.status_code in (429, 500, 502, 503, 504):
                         raise LLMTransientError(f"HTTP {r.status_code}: {r.text[:200]}")
                     if r.status_code != 200:
+                        # Samooprava: server v 400 řekne přesná čísla, takže
+                        # když se odhad netrefil, dopočítáme budget z nich
+                        # a zkusíme JEDNOU znovu (prompt zůstává beze změny).
+                        exact = (
+                            None if context_retry_done
+                            else exact_completion_from_error(r.text)
+                        )
+                        if exact:
+                            ctx_limit, input_tokens = exact
+                            room = ctx_limit - input_tokens - 64
+                            if room >= MIN_COMPLETION_TOKENS:
+                                context_retry_done = True
+                                logger.warning(
+                                    f"server hlásí kontext {ctx_limit} a prompt "
+                                    f"{input_tokens} tokenů → max_tokens "
+                                    f"{payload['max_tokens']} → {room}, zkouším znovu"
+                                )
+                                payload["max_tokens"] = room
+                                continue
                         raise LLMFatalError(f"HTTP {r.status_code}: {r.text[:500]}")
                     data = r.json()
                 except (

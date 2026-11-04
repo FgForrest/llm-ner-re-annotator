@@ -442,15 +442,15 @@ def test_effective_ner_labels_empty_taxonomy_falls_back():
 
 def test_bare_domain_brand_kept_not_dropped_as_url():
     """
-    Regression: 'Mall.cz' / 'iDnes.cz' / 'Alza.cz' jsou platné
+    Regression: 'AcmeShop.cz' / 'DemoZpravy.cz' / 'VzorObchod.cz' jsou platné
     ORGANIZACE / PRODUKT entity, NE URL. URL regex je nesmí dropnout.
     """
-    text = "E-shop Mall.cz nabízí produkty."
-    g = _make_graph([("e1", "Mall.cz", "ORGANIZACE", 7, 14)])
+    text = "E-shop AcmeShop.cz nabízí produkty."
+    g = _make_graph([("e1", "AcmeShop.cz", "ORGANIZACE", 7, 18)])
     res = normalize_graph(g, text, opts=NormalizeOpts(enabled=True))
     assert len(res.graph.entities) == 1
     assert res.graph.entities[0].category == "ORGANIZACE"
-    assert res.graph.entities[0].text == "Mall.cz"
+    assert res.graph.entities[0].text == "AcmeShop.cz"
     assert res.structural_identifiers_dropped == 0
 
 

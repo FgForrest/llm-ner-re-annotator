@@ -59,19 +59,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # ať prompt vypadá přesně jako v produkci.
 DOMAIN = "e-shop s kosmetikou a péčí o pleť"
 SAMPLE_TEXT = (
-    "Pleťové sérum Hydra Intense od značky ACME obsahuje nízkomolekulární "
-    "kyselinu hyaluronovou a vitamín B5, které intenzivně hydratují a vyhlazují "
-    "pokožku. Vhodné pro všechny typy pleti, zejména pro suchou a zralou pleť. "
-    "Aplikujte ráno a večer na očištěnou pleť před krémem. Balení 30 ml, "
-    "vyrobeno v České republice. Doporučená cena 349 Kč. Produkt je dermatologicky "
-    "testován a neobsahuje parabeny ani silikony. Kombinujte s pleťovým krémem "
-    "Hydra Intense pro maximální účinek. Skladujte při teplotě do 25 °C."
+    "Testovací pleťové sérum ALFA Aqua od smyšlené značky ACME obsahuje "
+    "kyselinu hyaluronovou a panthenol. Je určené pro normální i suchou pleť "
+    "a nanáší se ráno a večer na čistou pleť, než použijete krém. Balení má "
+    "50 ml a cena v tomto ukázkovém textu je 299 Kč. Sérum je bez parfemace "
+    "a bez barviv. Pro delší účinek ho můžete doplnit pleťovým krémem ALFA "
+    "Aqua ze stejné řady. Uchovávejte v suchu a mimo dosah přímého slunce. "
+    "Text je vymyšlený a slouží jen k měření propustnosti LLM serveru."
 )
 
 
 # Fake entity/relace pro RE a critic prompty (musí na čem stavět).
 FAKE_ENTITIES = [
-    {"id": "e1", "text": "Hydra Intense", "lemma": "Hydra Intense", "category": "PRODUKT"},
+    {"id": "e1", "text": "ALFA Aqua", "lemma": "ALFA Aqua", "category": "PRODUKT"},
     {"id": "e2", "text": "kyselina hyaluronová", "lemma": "kyselina hyaluronová", "category": "MATERIAL"},
     {"id": "e3", "text": "ACME", "lemma": "ACME", "category": "ORGANIZACE"},
 ]

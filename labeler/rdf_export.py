@@ -326,11 +326,17 @@ def build_owl_graph(
     ontology_label: str = "Mudrc Labeler Silver Dataset Ontology",
     ontology_comment: Optional[str] = None,
     max_text_len: int = 5000,
+    disjoint_mode: str = "off",
+    embedding_report: Optional[dict] = None,
 ) -> Graph:
     """
     Vrátí kompletní rdflib.Graph obsahující TBox (schema) + ABox (data).
 
     Lze pak serializovat do libovolného formátu (Turtle, RDF/XML, JSON-LD).
+
+    disjoint_mode + embedding_report: volitelná integrace výsledků embedding
+    analýzy taxonomie (viz add_semantic_disjointness). Default 'off' = žádná
+    změna exportu.
     """
     g = Graph()
     labels, relations = collect_labels_and_relations(records)
@@ -342,7 +348,99 @@ def build_owl_graph(
     )
     for rec in records:
         _add_abox_record(g, rec, max_text_len=max_text_len)
+    if disjoint_mode != "off" and embedding_report is not None:
+        add_semantic_disjointness(g, embedding_report, disjoint_mode)
     return g
+
+
+# ---------------------------------------------------------------------------
+# Sémantická disjunktnost z embedding analýzy (VOLITELNÉ — default off)
+# ---------------------------------------------------------------------------
+
+_VALID_DISJOINT_MODES = ("off", "annotate", "assert")
+
+
+def add_semantic_disjointness(
+    g: Graph, embedding_report: dict, mode: str,
+) -> int:
+    """
+    Zapracuje `disjoint_candidate` páry z taxonomy_embedding_report.json do
+    OWL grafu. Vrací počet zpracovaných párů.
+
+    mode='annotate' (doporučené): ŽÁDNÉ owl:disjointWith axiomy — jen auditní
+    RDF uzly typu :SemanticDisjointnessCandidate s kosinovou podobností,
+    použitým modelem, klasifikací a explicitní poznámkou, že jde o heuristický
+    návrh (formal_disjointness_proof=false).
+
+    mode='assert': přidá owl:disjointWith POUZE pro páry klasifikované jako
+    disjoint_candidate, jejichž OBĚ třídy v grafu existují. POZOR: embedding
+    podobnost NENÍ logický důkaz — tento režim může vytvořit nesprávné
+    axiomy; vyžaduje explicitní zapnutí a loguje výrazné varování.
+    owl:AllDisjointClasses se NIKDY nepřidává automaticky.
+
+    mode='off': no-op (vrací 0).
+    """
+    if mode == "off":
+        return 0
+    if mode not in _VALID_DISJOINT_MODES:
+        raise ValueError(
+            f"Neplatný TAXONOMY_OWL_DISJOINT_MODE={mode!r} "
+            f"(podporované: {', '.join(_VALID_DISJOINT_MODES)})"
+        )
+
+    model_name = str(embedding_report.get("model") or "unknown")
+    pairs = [
+        p for p in (embedding_report.get("pairs") or [])
+        if p.get("classification") == "disjoint_candidate"
+    ]
+    if mode == "assert":
+        logger.warning(
+            "TAXONOMY_OWL_DISJOINT_MODE=assert: přidávám owl:disjointWith "
+            "podle HEURISTICKÝCH disjoint_candidate párů z embedding analýzy. "
+            "TOTO NENÍ FORMÁLNÍ DŮKAZ — může vytvořit nesprávné logické "
+            "axiomy. Před publikací ontologie páry ručně zvaliduj."
+        )
+
+    added = 0
+    if mode == "annotate":
+        # Deklarace pomocné auditní třídy + properties (jednou).
+        g.add((VOCAB.SemanticDisjointnessCandidate, RDF.type, OWL.Class))
+        g.add((VOCAB.SemanticDisjointnessCandidate, RDFS.comment, Literal(
+            "Heuristic semantic-disjointness suggestion from embedding "
+            "analysis. NOT a formal OWL disjointness proof.", lang="en"
+        )))
+    for p in sorted(pairs, key=lambda x: (str(x.get("class_a")), str(x.get("class_b")))):
+        a, b = str(p.get("class_a") or ""), str(p.get("class_b") or "")
+        if not (_is_valid_label(a) and _is_valid_label(b)):
+            continue
+        cls_a, cls_b = VOCAB[a], VOCAB[b]
+        # Jen třídy, které v exportované ontologii reálně existují.
+        if (cls_a, RDF.type, OWL.Class) not in g or \
+           (cls_b, RDF.type, OWL.Class) not in g:
+            continue
+        if mode == "assert":
+            g.add((cls_a, OWL.disjointWith, cls_b))
+        else:  # annotate
+            node = VOCAB[f"semanticDisjointCandidate_{a}_{b}"]
+            g.add((node, RDF.type, VOCAB.SemanticDisjointnessCandidate))
+            g.add((node, VOCAB.classA, cls_a))
+            g.add((node, VOCAB.classB, cls_b))
+            g.add((node, VOCAB.cosineSimilarity, Literal(
+                float(p.get("cosine_similarity", 0.0)), datatype=XSD.double
+            )))
+            g.add((node, VOCAB.embeddingModel, Literal(model_name)))
+            g.add((node, VOCAB.classification, Literal("disjoint_candidate")))
+            g.add((node, VOCAB.heuristicOnly, Literal(True)))
+            g.add((node, RDFS.comment, Literal(
+                "Heuristic suggestion only (semantic embedding distance); "
+                "not asserted as owl:disjointWith.", lang="en"
+            )))
+        added += 1
+    logger.info(
+        f"OWL semantic disjointness: mode={mode}, zpracováno {added} "
+        f"disjoint_candidate párů (model {model_name})"
+    )
+    return added
 
 
 def write_owl_files(
@@ -354,6 +452,8 @@ def write_owl_files(
     max_text_len: int = 5000,
     write_ttl: bool = True,
     write_html: bool = True,
+    disjoint_mode: str = "off",
+    embedding_report: Optional[dict] = None,
 ) -> dict:
     """
     Hlavní entry point: vyrobí OWL ontologii a serializuje do souborů.
@@ -373,6 +473,8 @@ def write_owl_files(
         ontology_iri=ontology_iri,
         ontology_label=ontology_label or "Mudrc Labeler Silver Dataset Ontology",
         max_text_len=max_text_len,
+        disjoint_mode=disjoint_mode,
+        embedding_report=embedding_report,
     )
 
     base_path = Path(base_path)
@@ -489,6 +591,20 @@ def write_per_source_owl(
     return out_stats
 
 
+def _load_embedding_report_if_any(base_jsonl_path: Path) -> Optional[dict]:
+    """Zkusí načíst taxonomy_embedding_report.json vedle finálních výstupů
+    (checkpoint dir). Chybějící/nevalidní soubor → None (žádná výjimka)."""
+    import json as _json
+    report_path = base_jsonl_path.parent / "taxonomy_embedding_report.json"
+    if not report_path.exists():
+        return None
+    try:
+        return _json.loads(report_path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError) as e:
+        logger.warning(f"Embedding report {report_path} nejde načíst ({e}).")
+        return None
+
+
 def export_owl(
     records: list[dict], base_jsonl_path: Path,
     *,
@@ -497,6 +613,7 @@ def export_owl(
     max_text_len: int = 5000,
     write_ttl: bool = True,
     write_html: bool = True,
+    disjoint_mode: Optional[str] = None,
 ) -> dict:
     """
     Hlavní entry point z finalize.py.
@@ -504,13 +621,38 @@ def export_owl(
     `base_jsonl_path` — typicky `checkpoints/smoke/final_labels.jsonl`.
     Z toho odvodíme `final_labels.owl` a per-source split.
 
+    disjoint_mode: off/annotate/assert (None = z TAXONOMY_OWL_DISJOINT_MODE,
+    default 'off' — žádná změna exportu). annotate/assert vyžadují existující
+    taxonomy_embedding_report.json vedle výstupů; bez něj se tiše přeskočí.
+
     Vrátí dict se statistikou (počty souborů, počty triplů, počty records).
     """
+    if disjoint_mode is None:
+        from .config import CONFIG
+        disjoint_mode = CONFIG.taxonomy_owl_disjoint_mode
+    if disjoint_mode not in _VALID_DISJOINT_MODES:
+        raise ValueError(
+            f"Neplatný TAXONOMY_OWL_DISJOINT_MODE={disjoint_mode!r} "
+            f"(podporované: {', '.join(_VALID_DISJOINT_MODES)})"
+        )
+    embedding_report: Optional[dict] = None
+    if disjoint_mode != "off":
+        embedding_report = _load_embedding_report_if_any(base_jsonl_path)
+        if embedding_report is None:
+            logger.warning(
+                f"TAXONOMY_OWL_DISJOINT_MODE={disjoint_mode}, ale "
+                f"taxonomy_embedding_report.json neexistuje — disjunktnost "
+                f"se přeskakuje. Spusť `python -m labeler.main "
+                f"taxonomy-embeddings` před exportem."
+            )
+            disjoint_mode = "off"
+
     base_owl_path = base_jsonl_path.with_suffix(".owl")
     stats: dict = {
         "records": len(records),
         "combined": None,
         "per_source": [],
+        "disjoint_mode": disjoint_mode,
     }
 
     if combined:
@@ -519,6 +661,8 @@ def export_owl(
             max_text_len=max_text_len,
             write_ttl=write_ttl,
             write_html=write_html,
+            disjoint_mode=disjoint_mode,
+            embedding_report=embedding_report,
         )
         stats["combined"] = sub
 

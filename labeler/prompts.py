@@ -183,6 +183,10 @@ def _taxonomy_block(taxonomy) -> str:
         if counter_examples:
             ce = ", ".join(counter_examples[:6])
             lines.append(f"      NE sem (patří jinam): {ce}")
+        # Embeddingy (fáze 0b): třídy, se kterými se tahle nejsnáz splete.
+        confusable_with = getattr(lb, "confusable_with", None)
+        if confusable_with:
+            lines.append(f"      Pozor na záměnu s: {', '.join(confusable_with[:4])}")
     return "\n".join(lines)
 
 
@@ -207,7 +211,7 @@ systém — NIKDY nevytváříš vlastní kategorie jako "INSURANCE_PRODUCT", "P
 Ilustrace mapování (stejná kategorie, různé domény):
 
   PRODUKT:     "ProBook 450 G10" / "Pojištění auta OMEGA" / "Byt 3+kk Žižkov"
-               "VW Passat Combi 2.0 TDI" / "Věrnostní karta Premium" / "Xero Basic"
+               "VW Passat Combi 2.0 TDI" / "Věrnostní karta Premium" / "ACME Basic"
                → vždy PRODUKT, nikdy "LAPTOP", "POLICY", "LISTING", "SUBSCRIPTION"
 
   KATEGORIE:   "firemní notebook" / "povinné ručení" / "byt k pronájmu"
@@ -514,6 +518,8 @@ Přezkoumej původní výstup ve světle zpětné vazby a rozhodni:
   b) Pokud s kritikem nesouhlasíš nebo je výhrada nepodložená → vrať původní
      výstup beze změn.
 
+{categories_rule}
+
 Vrať POUZE validní JSON s klíči "entities" a "relations". Žádný text navíc."""
 
 
@@ -541,6 +547,7 @@ def build_extractor_revision_messages(
     critic_reasoning: str,
     corrected_graph: Optional[dict] = None,
     context: Optional[str] = None,
+    taxonomy=None,
 ) -> list[dict]:
     """
     Sestaví messages pro re-evaluaci extraktoru po zpětné vazbě critica.
@@ -567,7 +574,10 @@ def build_extractor_revision_messages(
         corrected_section=corrected_section,
     )
     return [
-        {"role": "system", "content": EXTRACTOR_REVISION_SYSTEM},
+        {"role": "system", "content": EXTRACTOR_REVISION_SYSTEM.replace(
+            "{categories_rule}",
+            _critic_categories_rule(taxonomy, _REVISION_DEFAULT_CATEGORIES_RULE),
+        )},
         {"role": "user", "content": user},
     ]
 
@@ -575,6 +585,60 @@ def build_extractor_revision_messages(
 # ---------------------------------------------------------------------------
 # Critic — system prompt a user template
 # ---------------------------------------------------------------------------
+
+def _indent_block(block: str, prefix: str = "   ") -> str:
+    """Odsadí víceřádkový blok, ať sedí pod odrážkou pravidla v promptu."""
+    return "\n".join(prefix + ln if ln else ln for ln in block.split("\n"))
+
+
+# Default 16 kategorií — platí JEN když fáze 0 nedodala vlastní taxonomii.
+_CRITIC_DEFAULT_CATEGORIES_RULE = (
+    "B) KATEGORIE jsou univerzální a platí pro jakoukoli doménu:\n"
+    "   PRODUKT, KATEGORIE, KOMPONENTA, PARAMETR, HODNOTA, MATERIAL, VLASTNOST,\n"
+    "   BENEFIT, POUZITI, TECHNOLOGIE, SPECIFIKACE, ORGANIZACE, OSOBA, MISTO, DATUM, SUBJEKT.\n"
+    "   Pokud model vrátil neexistující kategorii (INSURANCE_PRODUCT, DEDUCTIBLE, PERIL,\n"
+    "   LISTING, MAKE, MODEL, SPEC, AMOUNT apod.) → oprav v 'revised'."
+)
+
+_CRITIC_NER_DEFAULT_CATEGORIES_RULE = (
+    "B) Kategorie jsou univerzální: PRODUKT, KATEGORIE, KOMPONENTA, PARAMETR, HODNOTA,\n"
+    "   MATERIAL, VLASTNOST, BENEFIT, POUZITI, TECHNOLOGIE, SPECIFIKACE, ORGANIZACE,\n"
+    "   OSOBA, MISTO, DATUM, SUBJEKT. Neexistující kategorii (INSURANCE_PRODUCT,\n"
+    "   DEDUCTIBLE, MAKE…) → oprav v 'revised'."
+)
+
+_REVISION_DEFAULT_CATEGORIES_RULE = (
+    "POVOLENÉ KATEGORIE: PRODUKT, KATEGORIE, KOMPONENTA, PARAMETR, HODNOTA,\n"
+    "MATERIAL, VLASTNOST, BENEFIT, POUZITI, TECHNOLOGIE, SPECIFIKACE, ORGANIZACE,\n"
+    "OSOBA, MISTO, DATUM, SUBJEKT. Jinou kategorii nevracej."
+)
+
+
+def _critic_categories_rule(taxonomy, default_rule: str) -> str:
+    """
+    Pravidlo o povolených kategoriích pro critic / revisora.
+
+    S vlastní taxonomií z fáze 0 (entity_taxonomy.json) je povolený slovník
+    PŘESNĚ ta taxonomie — critic i revisor vidí tentýž seznam labelů (včetně
+    decision_rule a counter_examples), jaký dostal extractor. Bez taxonomie
+    zůstává default 16 kategorií.
+
+    Tohle je podstatné: dřív měl critic v promptu natvrdo 16 defaultních
+    kategorií, takže u auto-discovered taxonomie označil platné labely za
+    neexistující a "opravil" je — a revisor, který povolený slovník neznal
+    vůbec, tu opravu potvrdil.
+    """
+    if taxonomy is None or not getattr(taxonomy, "labels", None):
+        return default_rule
+    return (
+        "B) KATEGORIE — povolený slovník je PŘESNĚ taxonomie tohoto projektu\n"
+        "   (fáze 0, entity_taxonomy.json), nic jiného a nic méně:\n"
+        + _indent_block(_taxonomy_block(taxonomy)) + "\n"
+        "   Label z tohohle seznamu je VŽDY platný — NIKDY ho neměň jen proto,\n"
+        "   že ti není známý nebo že bys čekal obecnější kategorii.\n"
+        "   Teprve kategorii, která v seznamu NENÍ, oprav na nejbližší z něj."
+    )
+
 
 CRITIC_SYSTEM = """Jsi nezávislý validátor výstupů NER/RE systému. Dostáváš původní text
 a JSON s entitami a relacemi, který vytvořil jiný model. Tvůj úkol je posoudit správnost.
@@ -598,11 +662,7 @@ A) ENTITA musí být explicitně zmíněna v textu — "text" musí odpovídat s
    Pole "text" stačí mít přesné — pozice (start_char, end_char) NEKONTROLUJ a
    NEPOSÍLEJ ve výstupu, dopočítá je deterministický kód mimo LLM.
 
-B) KATEGORIE jsou univerzální a platí pro jakoukoli doménu:
-   PRODUKT, KATEGORIE, KOMPONENTA, PARAMETR, HODNOTA, MATERIAL, VLASTNOST,
-   BENEFIT, POUZITI, TECHNOLOGIE, SPECIFIKACE, ORGANIZACE, OSOBA, MISTO, DATUM, SUBJEKT.
-   Pokud model vrátil neexistující kategorii (INSURANCE_PRODUCT, DEDUCTIBLE, PERIL,
-   LISTING, MAKE, MODEL, SPEC, AMOUNT apod.) → oprav v 'revised'.
+{categories_rule}
 
 C) RELAČNÍ PRAVIDLA — PREFERUJ přesné, ale OBECNÉ jsou taky OK:
    Tahle PŘESNÁ mapování jsou PREFEROVANÁ (použij je, když sedí):
@@ -679,10 +739,21 @@ def build_critic_messages(
     text: str,
     proposed: dict,
     context: Optional[str] = None,
+    taxonomy=None,
 ) -> list[dict]:
-    """Sestaví messages pro critic."""
+    """Sestaví messages pro critic.
+
+    `taxonomy` (fáze 0) určuje povolený slovník kategorií — MUSÍ to být ta
+    samá taxonomie, podle které extrahoval extractor.
+    """
+    # .replace, ne .format — prompt obsahuje doslovné JSON závorky
+    # ({"status": "ok", ...}), které by .format() interpretoval jako pole.
+    system = CRITIC_SYSTEM.replace(
+        "{categories_rule}",
+        _critic_categories_rule(taxonomy, _CRITIC_DEFAULT_CATEGORIES_RULE),
+    )
     return [
-        {"role": "system", "content": CRITIC_SYSTEM},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": CRITIC_USER_TEMPLATE.format(
@@ -973,10 +1044,7 @@ TVÉ MOŽNÉ ODPOVĚDI (vrať POUZE JSON, nic jiného):
 VALIDAČNÍ PRAVIDLA (entity):
 A) Entita musí být EXPLICITNĚ v textu — "text" = přesný substring. Pozice
    (start_char/end_char) NEKONTROLUJ ani NEVRACEJ (dopočítá je aplikace).
-B) Kategorie jsou univerzální: PRODUKT, KATEGORIE, KOMPONENTA, PARAMETR, HODNOTA,
-   MATERIAL, VLASTNOST, BENEFIT, POUZITI, TECHNOLOGIE, SPECIFIKACE, ORGANIZACE,
-   OSOBA, MISTO, DATUM, SUBJEKT. Neexistující kategorii (INSURANCE_PRODUCT,
-   DEDUCTIBLE, MAKE…) → oprav v 'revised'.
+{categories_rule}
 C) HALUCINACE: stejný text ve více entitách s různou kategorií → smaž. Katalogová
    čísla, EAN, ID, čísla smluv NEJSOU entity.
 D) MATERIÁL (kov, plast, sklo, cihla, dřevo) = MATERIAL/KOMPONENTA, nikdy ORGANIZACE.
@@ -1005,9 +1073,12 @@ Posuď POUZE ENTITY. Vrať JSON se "status", "reasoning" a volitelně "corrected
 
 
 def build_critic_ner_messages(
-    text: str, entities: list, context: Optional[str] = None
+    text: str, entities: list, context: Optional[str] = None, taxonomy=None
 ) -> list[dict]:
-    """Fáze 2a — validace POUZE entit (dedikovaný critic NER prompt)."""
+    """Fáze 2a — validace POUZE entit (dedikovaný critic NER prompt).
+
+    `taxonomy` (fáze 0) = povolený slovník kategorií, stejný jako u extractoru.
+    """
     user = CRITIC_NER_USER_TEMPLATE.format(
         text=text,
         context=context or "(žádná)",
@@ -1016,8 +1087,12 @@ def build_critic_ner_messages(
             ensure_ascii=False, indent=2,
         ),
     )
+    system = CRITIC_NER_SYSTEM.replace(
+        "{categories_rule}",
+        _critic_categories_rule(taxonomy, _CRITIC_NER_DEFAULT_CATEGORIES_RULE),
+    )
     return [
-        {"role": "system", "content": CRITIC_NER_SYSTEM},
+        {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
 
@@ -1098,6 +1173,8 @@ validátora ke svým ENTITÁM. Přezkoumej je ve světle vazby a rozhodni:
      navigační šum) → vrať OPRAVENÉ entity.
   b) Výhrada je nepodložená nebo s ní nesouhlasíš → vrať PŮVODNÍ entity beze změny.
 
+{categories_rule}
+
 Řeš POUZE ENTITY (relace neřešíš). Vrať POUZE validní JSON {"entities": [...]} —
 žádný text navíc."""
 
@@ -1126,6 +1203,7 @@ def build_revision_ner_messages(
     critic_reasoning: str,
     corrected_entities: Optional[list] = None,
     context: Optional[str] = None,
+    taxonomy=None,
 ) -> list[dict]:
     """Fáze 2b-revise (NER) — re-eval kritiky entit (dedikovaný prompt)."""
     if corrected_entities:
@@ -1151,7 +1229,10 @@ def build_revision_ner_messages(
         corrected_section=corrected_section,
     )
     return [
-        {"role": "system", "content": REVISION_NER_SYSTEM},
+        {"role": "system", "content": REVISION_NER_SYSTEM.replace(
+            "{categories_rule}",
+            _critic_categories_rule(taxonomy, _REVISION_DEFAULT_CATEGORIES_RULE),
+        )},
         {"role": "user", "content": user},
     ]
 

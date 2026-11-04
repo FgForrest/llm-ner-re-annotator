@@ -1,4 +1,4 @@
-# Spusti SGLang server v background modu, pocka az odpovi /v1/models.
+﻿# Spusti SGLang server v background modu, pocka az odpovi /v1/models.
 # PID zaloguje do %TEMP%\sglang_<port>.pid pro pozdejsi stop_native_llm.ps1.
 #
 # Pouziti:
@@ -28,7 +28,7 @@ function Write-Err  { param($m) Write-Host "`n!! $m" -ForegroundColor Red }
 function Write-Warn { param($m) Write-Host "`n!! $m" -ForegroundColor Yellow }
 
 # ---------------------------------------------------------------------------
-# HF_TOKEN preflight — gated modely (Gemma, Llama) bez tokenu nepojedou
+# HF_TOKEN preflight - gated modely (Gemma, Llama) bez tokenu nepojedou
 # ---------------------------------------------------------------------------
 if ($ModelPath -match "(Gemma|gemma|Llama|llama|meta-llama|google)") {
     if (-not $env:HF_TOKEN -or $env:HF_TOKEN -eq "hf_TADY_DOPLN_TOKEN") {
@@ -70,7 +70,7 @@ try {
     $resp = Invoke-WebRequest -Uri "http://localhost:$Port/v1/models" `
         -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
     if ($resp.StatusCode -lt 400) {
-        Write-Warn "Port $Port uz odpovida — nejaky LLM tam bezi. Nech ho byt."
+        Write-Warn "Port $Port uz odpovida - nejaky LLM tam bezi. Nech ho byt."
         exit 0
     }
 } catch {

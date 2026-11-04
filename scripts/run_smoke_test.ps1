@@ -1,21 +1,22 @@
-# Production smoke test — empiricky odhad doby behu pipeline na cilovem HW.
+﻿# Production smoke test - empiricky odhad doby behu pipeline na cilovem HW.
 #
 # Co dela:
-#   1. Z kazdeho datasetu v data/ vezme N items (default 50)
+#   1. Z kazdeho datasetu v data/ vezme N items (zepta se; default 100)
 #   2. Postupne spusti vsechny 4 faze (extract/critic/revise/finalize) na
-#      smoke vzorku — vzdy 1 model na GPU, jako v produkci
+#      smoke vzorku - vzdy 1 model na GPU, jako v produkci
 #   3. Meri wall-clock per faze
-#   4. Linearne extrapoluje na full produkcni rozsah (pure empirical —
+#   4. Linearne extrapoluje na full produkcni rozsah (pure empirical -
 #      zadne teoreticke scaling factory, zadne GPU-class projekce)
 #   5. Vygeneruje report (Markdown + JSON) v checkpoints/smoke/
 #
-# Pouziti (DOCKER runtime — default):
+# Pouziti (DOCKER runtime - default):
 #   .\scripts\run_smoke_test.ps1                                       # interaktivni prompt
-#   .\scripts\run_smoke_test.ps1 -GpuCount 2                           # preskoci prompt
-#   .\scripts\run_smoke_test.ps1 -SamplesPerDataset 100
+#   .\scripts\run_smoke_test.ps1 -GpuCount 2                           # preskoci prompt (typ z nvidia-smi / B200)
+#   .\scripts\run_smoke_test.ps1 -GpuType rtxpro6000 -GpuCount 2       # 2x RTX PRO 6000
+#   .\scripts\run_smoke_test.ps1 -SamplesPerDataset 100          # preskoci dotaz na pocet polozek
 #   .\scripts\run_smoke_test.ps1 -SmokePhases "extract","critic","finalize"
 #
-# Pouziti (NATIVE runtime — bez dockeru):
+# Pouziti (NATIVE runtime - bez dockeru):
 #   # 1) Sam si spust LLM server, napr. v jinem terminalu:
 #   #    python -m sglang.launch_server --model-path RedHatAI/Qwen3.5-122B-A10B-NVFP4 ...
 #   # 2) Spust skript v native modu:
@@ -25,15 +26,19 @@
 #   $env:CRITIC_BASE_URL = "http://10.0.0.5:8001/v1"
 #   .\scripts\run_smoke_test.ps1 -Runtime native
 #
-# Skript se na zacatku zepta kolik B200 GPU mas (1, 2 nebo 4 - power-of-2
-# pro tensor parallelism MoE). Tento pocet pak nastavi EXTRACTOR_TP_SIZE
-# a HW_LABEL pro report. Pokud -GpuCount je predany, prompt se preskoci.
+# Skript se na zacatku zepta na typ GPU (B200 / RTX PRO 6000) a kolik jich
+# mas (power-of-2 pro tensor parallelism MoE; RTX PRO 6000 min. 2 - Qwen 122B
+# se na jednu 96GB kartu nevejde). Podle toho nastavi EXTRACTOR_TP_SIZE
+# a HW_LABEL pro report. -GpuType / -GpuCount prompt preskoci.
 
 param(
     [int]$GpuCount = 0,                       # 0 = interactive prompt
+    [ValidateSet("b200", "rtxpro6000", "a100")]
+    [string]$GpuType = "",                    # "" = prompt (s -GpuCount: nvidia-smi, jinak b200)
     [string]$HwLabel = "",                    # auto-derive from GpuCount if empty
-    [int]$SamplesPerDataset = 100,
-    [string[]]$SmokePhases = @("extract", "critic", "revise", "finalize"),
+    [int]$SamplesPerDataset = 0,              # 0 = interactive prompt (Enter / bez terminalu = 100)
+    [string[]]$SmokePhases = @("sample", "taxonomy", "extract", "critic", "revise", "finalize"),
+    [string]$TaxonomySamples = "",            # auto | cislo; "" = prompt (Enter = .env / auto)
     [double]$DockerStartupS = 0.0,
     [ValidateSet("docker", "native")]
     [string]$Runtime = "docker"               # docker (default) / native (host Python proti bezicimu LLM serveru)
@@ -43,10 +48,19 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location (Join-Path $ScriptDir "..")
 
+function Write-Log  { param($m) Write-Host "`n==> $m" -ForegroundColor Cyan }
+function Write-Err  { param($m) Write-Host "`n!! $m" -ForegroundColor Red }
+function Write-Warn { param($m) Write-Host "`n!! $m" -ForegroundColor Yellow }
+
 # ---------------------------------------------------------------------------
 # Preflight checks + Interactive GPU prompt
 # ---------------------------------------------------------------------------
 function Get-DetectedGpuCount {
+    # PS 5.1: redirect stderr nativniho prikazu (2>$null / 2>&1) bali radky
+    # do ErrorRecordu; s globalnim $ErrorActionPreference=Stop by PRVNI progress
+    # hlaska dockeru (jde na stderr) shodila skript. Lokalni Continue plati
+    # jen pro tuto funkci.
+    $ErrorActionPreference = "Continue"
     if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
         return 0
     }
@@ -86,7 +100,7 @@ function Test-HfTokenPreflight {
 }
 
 # ---------------------------------------------------------------------------
-# .env auto-config — po prompt podle GpuCount
+# .env auto-config - po prompt podle GpuCount
 # ---------------------------------------------------------------------------
 function Update-EnvVar {
     param([string]$File, [string]$Key, [string]$Value)
@@ -107,38 +121,283 @@ function Update-EnvVar {
     Set-Content -Path $File -Value $newLines -Encoding utf8
 }
 
+# ---------------------------------------------------------------------------
+# HW presety per typ GPU (modely, kvantizace, backendy, VRAM, kontext)
+# ---------------------------------------------------------------------------
+# Blackwell (b200 / rtxpro6000) -> NVFP4 modely, SGLang primarne.
+# Ampere (a100 40 GB)           -> SGLang jako na Blackwellu, ale INT4 misto
+#   NVFP4/FP8: NVFP4 chce Blackwell a FP8 u MoE na SM80 nejde v zadnem enginu
+#   (chybi fp8e4nv; sglang#12887, #7715, vllm#18008, vllm#54318). INT4 W4A16
+#   pres Marlin MoE ale SGLang na Ampere umi (overeno na SM80/SM86):
+#   extraktor Qwen/Qwen3.5-122B-A10B-GPTQ-Int4 (~65 GB vah, TP=4 -> ~17 GB/GPU),
+#   critic je dense a jede oficialni QAT google/gemma-4-31B-it-qat-w4a16-ct
+#   (~20 GB vah) -> TP=2. Backendy zustavaji "sglang vllm" (vLLM = zaloha).
+#   Pokud SGLang Marlin MoE spadne na dtype aktivaci, nastav
+#   EXTRACTOR_DTYPE=float16.
+#
+# Modely/parametry se prepisou JEN kdyz v .env drzi nekterou ze spravovanych
+# hodnot (nebo nic) - vlastni model uzivatele zustane.
+$script:ManagedExtractorModels = @(
+    "RedHatAI/Qwen3.5-122B-A10B-NVFP4",
+    "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
+    "QuantTrio/Qwen3.5-122B-A10B-AWQ",
+    "Intel/Qwen3.5-122B-A10B-int4-AutoRound",
+    "RedHatAI/Qwen3.5-122B-A10B-FP8-dynamic",
+    "Qwen/Qwen3.5-122B-A10B-FP8",
+    "Qwen/Qwen3.5-122B-A10B"
+)
+$script:ManagedCriticModels = @(
+    "nvidia/Gemma-4-31B-IT-NVFP4",
+    "google/gemma-4-31B-it-qat-w4a16-ct",
+    "RedHatAI/gemma-4-31B-it-FP8-block",
+    "google/gemma-4-31B-it"
+)
+# Hodnoty *_BATCH_SIZE, ktere nastavuji samotne presety - jen ty se prepisuji
+# pri zmene HW. Vlastni cislo (z auto_tune nebo z dotazu pri startu) zustava.
+$script:ManagedExtractorBatch = @("8", "32")
+$script:ManagedCriticBatch = @("16", "64")
+
+function Read-EnvVarValue {
+    param([string]$File, [string]$Key)
+    if (-not (Test-Path $File)) { return "" }
+    $val = ""
+    foreach ($line in (Get-Content $File)) {
+        if ($line -match "^[ 	TABESC]*${Key}=(.*)$") { $val = $Matches[1].Trim() }
+    }
+    return $val
+}
+
+# Zapise hodnotu jen pokud je aktualni prazdna nebo patri do spravovaneho seznamu.
+function Update-EnvVarIfManaged {
+    param([string]$File, [string]$Key, [string]$Value, [string[]]$Managed)
+    $cur = Read-EnvVarValue -File $File -Key $Key
+    if (-not $cur) {
+        Update-EnvVar -File $File -Key $Key -Value $Value
+        return
+    }
+    if ($Managed -contains $cur) {
+        if ($cur -ne $Value) { Update-EnvVar -File $File -Key $Key -Value $Value }
+        return
+    }
+    Write-Warn "$Key='$cur' je vlastni hodnota - nechavam ji (HW preset by nastavil '$Value')."
+}
+
+# Zvedne hodnotu na minimum (nizsi prepise, vyssi uzivatelovu necha).
+function Update-EnvVarMinimum {
+    param([string]$File, [string]$Key, [int]$Min, [string]$Reason)
+    $cur = Read-EnvVarValue -File $File -Key $Key
+    $curInt = 0
+    if ($cur -match '^\d+') { $curInt = [int]($cur -replace '\\.*$', '') }
+    if ($curInt -lt $Min) {
+        Update-EnvVar -File $File -Key $Key -Value "$Min"
+        Write-Log "Auto-config: $Key=$Min ($Reason)"
+    }
+}
+
+function Set-GpuPreset {
+    param([string]$File, [string]$Type, [int]$Count)
+    if ($Type -eq "a100") {
+        # INT4 W4A16 - to SGLang i vLLM na Ampere umi pres Marlin (FP8 ne).
+        Update-EnvVarIfManaged -File $File -Key "EXTRACTOR_MODEL" `
+            -Value "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4" -Managed $script:ManagedExtractorModels
+        Update-EnvVarIfManaged -File $File -Key "CRITIC_MODEL" `
+            -Value "google/gemma-4-31B-it" -Managed $script:ManagedCriticModels
+        # Qwen3.5 MoE INT4 v SGLangu jede Triton w4a16 cestou (moe_wna16),
+        # NE Marlinem: Marlin MoE si pri prepacku vyrobi fp16 scales, takze
+        # v bf16 spadne assert v moe_wna16_marlin_gemm a ve fp16 zas GDN conv
+        # cache, ktera zustava bf16 (sglang#30178). moe_wna16 = bf16 vsude.
+        Update-EnvVar -File $File -Key "EXTRACTOR_QUANTIZATION" -Value "moe_wna16"
+        Update-EnvVar -File $File -Key "CRITIC_QUANTIZATION" -Value ""
+        # Dtype nechavame na auto-detectu (bf16) - fp16 uz neni potreba
+        Update-EnvVar -File $File -Key "EXTRACTOR_DTYPE" -Value ""
+        Update-EnvVar -File $File -Key "CRITIC_DTYPE" -Value ""
+        # GDN conv cache MUSI mit stejny dtype jako model - zbytkovy float16
+        # z predchoziho pokusu shodi Triton kernel causal_conv1d.
+        Update-EnvVar -File $File -Key "SGLANG_MAMBA_CONV_DTYPE" -Value ""
+        # Vsechny faze na SGLangu, vLLM jen jako zaloha.
+        Update-EnvVar -File $File -Key "EXTRACTOR_BACKENDS" -Value "sglang vllm"
+        Update-EnvVar -File $File -Key "CRITIC_BACKENDS" -Value "sglang vllm"
+        Update-EnvVar -File $File -Key "REVISE_BACKENDS" -Value "sglang vllm"
+        # Critic bf16 Gemma 4 31B ~62 GB vah -> TP=4 (~15,5 GB/GPU).
+        # Kvantizovane varianty by se vlezly na 2 karty, ale SGLang je na
+        # Ampere nenalozi (QAT checkpoint ma kvantizovany jen jazykovy model
+        # a SGLang pro vision tower vyrobi params, ktere v nem nejsou).
+        # Faze jedou po sobe, takze 4 karty pro critic nic neblokuji.
+        Update-EnvVar -File $File -Key "CRITIC_TP_SIZE" -Value "4"
+        # Triton moe_wna16 + prefill CUDA grafy se na 40GB karte pri 0.92
+        # nevejdou (dokumentovany priklad jede 0.8-0.85).
+        Update-EnvVar -File $File -Key "EXTRACTOR_MEM_FRACTION" -Value "0.85"
+        Update-EnvVar -File $File -Key "CRITIC_MEM_FRACTION" -Value "0.88"
+        # Extraktor 64k: prompt faze 0 mel pres 31k tokenu a do 32k se
+        # s odpovedi nevejde. Max kontext nealokuje pamet (KV pool urcuje
+        # *_MEM_FRACTION). Critic ma per-item prompty -> 32k staci.
+        Update-EnvVar -File $File -Key "EXTRACTOR_CONTEXT_LEN" -Value "65536"
+        Update-EnvVar -File $File -Key "CRITIC_CONTEXT_LEN" -Value "32768"
+        Update-EnvVar -File $File -Key "EXTRACTOR_MAX_TOKENS" -Value "16384"
+        Update-EnvVar -File $File -Key "CRITIC_MAX_TOKENS" -Value "24576"
+        Update-EnvVar -File $File -Key "EXTRACTOR_NER_MAX_TOKENS" -Value "8192"
+        # Server-side davky (max-running-requests) - nealokuji pamet, KV pool
+        # je dan *_MEM_FRACTION. Mala davka = dequant vah se rozpusti do mala
+        # tokenu -> karty jen na ~40 % TDP. Optimum zmeri auto_tune_concurrency.
+        # *_CONCURRENCY zamerne NEPREPISUJEME (drzi si .env).
+        Update-EnvVarIfManaged -File $File -Key "EXTRACTOR_BATCH_SIZE" `
+            -Value "32" -Managed $script:ManagedExtractorBatch
+        Update-EnvVarIfManaged -File $File -Key "CRITIC_BATCH_SIZE" `
+            -Value "64" -Managed $script:ManagedCriticBatch
+        # Marlin dequant do BF16 + male davky = pomalejsi per-request
+        Update-EnvVarMinimum -File $File -Key "LLM_TIMEOUT_S" -Min 7200 `
+            -Reason "A100: Marlin dequant, mensi davky"
+        Write-Log ("Auto-config ${File}: A100 preset - extraktor GPTQ-Int4 " +
+                   "(moe_wna16, TP=$Count, kontext 65536), critic bf16 Gemma " +
+                   "(TP=4, kontext 32768), backend sglang+vllm")
+        return
+    }
+    # Blackwell -> NVFP4 (plny NVFP4 stack, SGLang primarne)
+    Update-EnvVarIfManaged -File $File -Key "EXTRACTOR_MODEL" `
+        -Value "RedHatAI/Qwen3.5-122B-A10B-NVFP4" -Managed $script:ManagedExtractorModels
+    Update-EnvVarIfManaged -File $File -Key "CRITIC_MODEL" `
+        -Value "nvidia/Gemma-4-31B-IT-NVFP4" -Managed $script:ManagedCriticModels
+    Update-EnvVar -File $File -Key "EXTRACTOR_QUANTIZATION" -Value ""
+    Update-EnvVar -File $File -Key "CRITIC_QUANTIZATION" -Value ""
+    # NVFP4 jede v bf16 -> dtype nechavame na auto-detectu
+    Update-EnvVar -File $File -Key "EXTRACTOR_DTYPE" -Value ""
+    Update-EnvVar -File $File -Key "CRITIC_DTYPE" -Value ""
+    # conv cache v sync s modelem (viz A100 vyse)
+    Update-EnvVar -File $File -Key "SGLANG_MAMBA_CONV_DTYPE" -Value ""
+    Update-EnvVar -File $File -Key "EXTRACTOR_BACKENDS" -Value "sglang vllm"
+    Update-EnvVar -File $File -Key "CRITIC_BACKENDS" -Value "sglang vllm"
+    Update-EnvVar -File $File -Key "REVISE_BACKENDS" -Value "sglang vllm"
+    Update-EnvVar -File $File -Key "CRITIC_TP_SIZE" -Value "1"
+    Update-EnvVar -File $File -Key "EXTRACTOR_MEM_FRACTION" -Value "0.85"
+    Update-EnvVar -File $File -Key "CRITIC_MEM_FRACTION" -Value "0.85"
+    Update-EnvVar -File $File -Key "EXTRACTOR_CONTEXT_LEN" -Value "65536"
+    Update-EnvVar -File $File -Key "CRITIC_CONTEXT_LEN" -Value "65536"
+    Update-EnvVar -File $File -Key "EXTRACTOR_MAX_TOKENS" -Value "24576"
+    Update-EnvVar -File $File -Key "CRITIC_MAX_TOKENS" -Value "49152"
+    Update-EnvVar -File $File -Key "EXTRACTOR_NER_MAX_TOKENS" -Value "8192"
+    # *_CONCURRENCY nechavame na .env / auto_tune_concurrency.sh
+    Update-EnvVarIfManaged -File $File -Key "EXTRACTOR_BATCH_SIZE" `
+        -Value "32" -Managed $script:ManagedExtractorBatch
+    Update-EnvVarIfManaged -File $File -Key "CRITIC_BATCH_SIZE" `
+        -Value "64" -Managed $script:ManagedCriticBatch
+    if ($Type -eq "rtxpro6000") {
+        # GDDR7 + TP pres PCIe -> delsi worst-case request
+        Update-EnvVarMinimum -File $File -Key "LLM_TIMEOUT_S" -Min 3600 -Reason "RTX PRO 6000"
+    }
+}
+
 function Set-EnvForGpuCount {
-    param([int]$Count)
+    param([int]$Count, [string]$Type = "b200")
     $envFile = if ($env:ENV_FILE) { $env:ENV_FILE } else { ".env" }
     if (-not (Test-Path $envFile)) {
         if (Test-Path ".env.example") {
             Copy-Item ".env.example" $envFile
             Write-Log "Vytvoreno $envFile z .env.example (auto-config)"
         } else {
-            Write-Warn "Neexistuje $envFile ani .env.example — auto-config preskocen."
+            Write-Warn "Neexistuje $envFile ani .env.example - auto-config preskocen."
             return
         }
     }
+    Update-EnvVar -File $envFile -Key "GPU_TYPE" -Value $Type
     Update-EnvVar -File $envFile -Key "GPU_COUNT" -Value "$Count"
     Update-EnvVar -File $envFile -Key "EXTRACTOR_TP_SIZE" -Value "$Count"
-    Update-EnvVar -File $envFile -Key "CRITIC_TP_SIZE" -Value "1"
-    Write-Log "Auto-config ${envFile}: GPU_COUNT=$Count EXTRACTOR_TP_SIZE=$Count CRITIC_TP_SIZE=1"
+    # HW preset: modely + kvantizace + backendy + VRAM + kontext + davky
+    # (NVFP4 na Blackwellu, INT4/FP8 + vLLM na Ampere - viz Set-GpuPreset).
+    Set-GpuPreset -File $envFile -Type $Type -Count $Count
+    $criticTp = Read-EnvVarValue -File $envFile -Key "CRITIC_TP_SIZE"
+    if (-not $criticTp) { $criticTp = "1" }
+    Write-Log "Auto-config ${envFile}: GPU_TYPE=$Type GPU_COUNT=$Count EXTRACTOR_TP_SIZE=$Count CRITIC_TP_SIZE=$criticTp"
+}
+
+# ---------------------------------------------------------------------------
+# Typ GPU (GpuType):
+#   b200        NVIDIA B200, 180 GB HBM3e - Qwen3.5-122B-NVFP4 (~80 GB vah)
+#               se vejde na 1 GPU -> 1, 2, 4 nebo 8 GPU
+#   rtxpro6000  NVIDIA RTX PRO 6000 Blackwell, 96 GB GDDR7 - Qwen se na jednu
+#               kartu nevejde (vahy + KV cache) -> extractor TP >= 2 -> 2, 4, 8
+#   a100        NVIDIA A100 40 GB (Ampere) - NVFP4/FP8 tam nejde, jede INT4
+#               W4A16 pres Marlin (SGLang i vLLM) -> 4 nebo 8 GPU
+# Pocty jen power-of-2 (TP=3/5/6/7 SGLang/vLLM pro MoE nepodporuji).
+# ---------------------------------------------------------------------------
+function Get-GpuTypeLabel {
+    param([string]$Type)
+    if ($Type -eq "rtxpro6000") { return "RTX PRO 6000" }
+    if ($Type -eq "a100") { return "A100 40GB" }
+    if ($Type -eq "b200") { return "B200" }
+    return $Type
+}
+
+function Get-GpuTypeCounts {
+    param([string]$Type)
+    if ($Type -eq "rtxpro6000") { return @(2, 4, 8) }
+    if ($Type -eq "a100") { return @(4, 8) }
+    return @(1, 2, 4, 8)
+}
+
+# Typ GPU podle nazvu prvni karty v nvidia-smi; "" = nerozpoznano.
+function Get-DetectedGpuType {
+    # PS 5.1: redirect stderr nativniho prikazu (2>$null / 2>&1) bali radky
+    # do ErrorRecordu; s globalnim $ErrorActionPreference=Stop by PRVNI progress
+    # hlaska dockeru (jde na stderr) shodila skript. Lokalni Continue plati
+    # jen pro tuto funkci.
+    $ErrorActionPreference = "Continue"
+    if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { return "" }
+    $name = & nvidia-smi --query-gpu=name --format=csv,noheader 2>$null | Select-Object -First 1
+    if ($name -match "B200") { return "b200" }
+    if ($name -match "RTX PRO 6000") { return "rtxpro6000" }
+    if ($name -match "A100") { return "a100" }
+    return ""
+}
+
+function Read-GpuType {
+    param([string]$Detected)
+    $default = ""
+    if ($Detected -eq "b200") { $default = "1" }
+    if ($Detected -eq "rtxpro6000") { $default = "2" }
+    if ($Detected -eq "a100") { $default = "3" }
+    Write-Host ""
+    Write-Host "════════════════════════════════════════════════════════"
+    Write-Host "  Jaky typ GPU mas k dispozici pro pipeline?"
+    Write-Host "    1) NVIDIA B200          (180 GB) - NVFP4, Qwen 122B na 1 GPU"
+    Write-Host "    2) NVIDIA RTX PRO 6000  (96 GB)  - NVFP4, Qwen 122B min. 2 GPU"
+    Write-Host "    3) NVIDIA A100          (40 GB)  - INT4 (W4A16), Qwen 122B min. 4 GPU"
+    if ($Detected) {
+        Write-Host "  -> Detekovano: $(Get-GpuTypeLabel $Detected)"
+    }
+    Write-Host "════════════════════════════════════════════════════════"
+    $prompt = if ($default) { "Vyber typ GPU [1/2/3] (Enter = $default)" } else { "Vyber typ GPU [1/2/3]" }
+    while ($true) {
+        $t = Read-Host $prompt
+        if (-not $t) { $t = $default }
+        if ($t -eq "1") { return "b200" }
+        if ($t -eq "2") { return "rtxpro6000" }
+        if ($t -eq "3") { return "a100" }
+        Write-Warning "Neplatna volba '$t'. Zadej 1, 2 nebo 3."
+    }
 }
 
 function Read-GpuCount {
-    param([int]$Detected)
+    param([int]$Detected, [string]$Type)
+    $label = Get-GpuTypeLabel $Type
+    $counts = Get-GpuTypeCounts $Type
     Write-Host ""
     Write-Host "════════════════════════════════════════════════════════"
-    Write-Host "  Kolik NVIDIA B200 GPU mas k dispozici pro pipeline?"
-    Write-Host "  Podporovane hodnoty: 1, 2, 4 nebo 8"
+    Write-Host "  Kolik NVIDIA $label GPU mas k dispozici pro pipeline?"
+    Write-Host "  Podporovane hodnoty: $($counts -join ', ')"
+    if ($Type -eq "rtxpro6000") {
+        Write-Host "  (min. 2 - Qwen 122B v NVFP4 se na jednu 96GB kartu nevejde)"
+    }
+    if ($Type -eq "a100") {
+        Write-Host "  (min. 4 - Qwen 122B v INT4 ~65 GB + KV cache; 4x40 GB = 160 GB)"
+    }
     Write-Host "  (jen power-of-2 - TP=3/5/6/7 SGLang/vLLM nepodporuji)"
     if ($Detected -gt 0) {
         Write-Host "  -> Detekovano $Detected GPU na hostu"
     }
     Write-Host "════════════════════════════════════════════════════════"
     while ($true) {
-        $n = Read-Host "Zadej pocet B200 GPU [1/2/4/8]"
-        if ($n -in @("1","2","4","8")) {
+        $n = Read-Host "Zadej pocet $label GPU [$($counts -join '/')]"
+        if ($n -match '^\d+$' -and [int]$n -in $counts) {
             $nInt = [int]$n
             if ($Detected -gt 0 -and $nInt -gt $Detected) {
                 Write-Warning "Host ma jen $Detected GPU, zadano $nInt. Vyber max $Detected."
@@ -146,7 +405,7 @@ function Read-GpuCount {
             }
             return $nInt
         }
-        Write-Warning "Neplatna hodnota '$n'. Zadej 1, 2, 4 nebo 8."
+        Write-Warning "Neplatna hodnota '$n'. Zadej $($counts -join ', ')."
     }
 }
 
@@ -160,10 +419,35 @@ if ($detected -gt 0) {
     Write-Warn "nvidia-smi nedostupne - nemuzu detekovat GPU count automaticky"
 }
 
+# Typ GPU: -GpuType > (s -GpuCount bez promptu) nvidia-smi / b200 > prompt
+if (-not $GpuType) {
+    $detectedType = Get-DetectedGpuType
+    if ($GpuCount -ne 0) {
+        $GpuType = if ($detectedType) { $detectedType } else { "b200" }
+    } else {
+        $GpuType = Read-GpuType -Detected $detectedType
+    }
+}
+$gpuLabel = Get-GpuTypeLabel $GpuType
+$validCounts = Get-GpuTypeCounts $GpuType
+Write-Log "Typ GPU: $gpuLabel"
+
+if ($detected -gt 0 -and $detected -lt $validCounts[0]) {
+    Write-Err "Host ma jen $detected GPU, ale $gpuLabel potrebuje min. $($validCounts[0])"
+    Write-Err "(Qwen3.5-122B se nevejde: NVFP4 ~80 GB / INT4 ~65 GB vah + KV cache)."
+    throw "GPU count mismatch"
+}
+
 if ($GpuCount -eq 0) {
-    $GpuCount = Read-GpuCount -Detected $detected
-} elseif ($GpuCount -notin @(1, 2, 4, 8)) {
-    Write-Error "-GpuCount musi byt 1, 2, 4 nebo 8 (dostal $GpuCount)"
+    $GpuCount = Read-GpuCount -Detected $detected -Type $GpuType
+} elseif ($GpuCount -notin $validCounts) {
+    Write-Err "-GpuCount $GpuCount neni pro $gpuLabel podporovany. Validni: $($validCounts -join ', ')."
+    if ($GpuType -eq "rtxpro6000") {
+        Write-Err "RTX PRO 6000 ma 96 GB - Qwen3.5-122B-NVFP4 se na jednu kartu nevejde."
+    }
+    if ($GpuType -eq "a100") {
+        Write-Err "A100 ma 40 GB - Qwen3.5-122B v INT4 (~65 GB) potrebuje min. 4 karty."
+    }
     exit 1
 } elseif ($detected -gt 0 -and $GpuCount -gt $detected) {
     Write-Err "GpuCount=$GpuCount, ale host ma jen $detected GPU."
@@ -171,36 +455,142 @@ if ($GpuCount -eq 0) {
     throw "GPU count mismatch"
 }
 
-# Auto-config .env podle GpuCount — pro docker compose i native
-Set-EnvForGpuCount -Count $GpuCount
+# Auto-config .env podle GpuType + GpuCount - pro docker compose i native
+Set-EnvForGpuCount -Count $GpuCount -Type $GpuType
 
 # Propagace do env pro docker compose
 $env:EXTRACTOR_TP_SIZE = "$GpuCount"
-if (-not $env:CRITIC_TP_SIZE) { $env:CRITIC_TP_SIZE = "1" }
+# CRITIC_TP_SIZE urcuje HW preset v .env (A100 -> 2, Blackwell -> 1);
+# explicitni $env: override ma prednost.
+if (-not $env:CRITIC_TP_SIZE) {
+    $criticTpFile = if ($env:ENV_FILE) { $env:ENV_FILE } else { ".env" }
+    $criticTpEnv = Read-EnvVarValue -File $criticTpFile -Key "CRITIC_TP_SIZE"
+    if ($criticTpEnv) { $env:CRITIC_TP_SIZE = $criticTpEnv } else { $env:CRITIC_TP_SIZE = "1" }
+}
+
+# ---------------------------------------------------------------------------
+# Interactive prompt - pocet polozek per dataset
+# ---------------------------------------------------------------------------
+# Kolik itemu z kazdeho datasetu projde smoke pipeline. Vic = presnejsi
+# extrapolace, ale delsi smoke test. -SamplesPerDataset dotaz preskoci;
+# bez terminalu (presmerovany vstup) se pouzije default.
+$DefaultSamplesPerDataset = 100
+
+function Read-SamplesPerDataset {
+    param([int]$Default)
+    Write-Host ""
+    Write-Host "════════════════════════════════════════════════════════"
+    Write-Host "  Kolik polozek z kazdeho datasetu ma smoke test zpracovat?"
+    Write-Host "  Vic = presnejsi odhad doby behu produkce, ale delsi smoke test."
+    Write-Host "════════════════════════════════════════════════════════"
+    while ($true) {
+        $n = Read-Host "Pocet polozek per dataset (Enter = $Default)"
+        if (-not $n) { return $Default }
+        if ($n -match '^[1-9]\d*$') { return [int]$n }
+        Write-Warning "Neplatna hodnota '$n'. Zadej kladne cele cislo."
+    }
+}
+
+if ($SamplesPerDataset -lt 0) {
+    Write-Err "-SamplesPerDataset musi byt kladne cele cislo (dostal $SamplesPerDataset)."
+    exit 1
+} elseif ($SamplesPerDataset -eq 0) {
+    if ([Console]::IsInputRedirected) {
+        $SamplesPerDataset = $DefaultSamplesPerDataset
+        Write-Log "Neinteraktivni beh -> SamplesPerDataset=$SamplesPerDataset (default)"
+    } else {
+        $SamplesPerDataset = Read-SamplesPerDataset -Default $DefaultSamplesPerDataset
+        Write-Log "OK: $SamplesPerDataset polozek per dataset"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Pocet ukazek pro NAVRH TAXONOMIE (TAXONOMY_SAMPLES_PER_DATASET: auto | cislo)
+# ---------------------------------------------------------------------------
+# auto  = kazda domena si pocet spocita sama z rozmanitosti obsahu (embeddingy
+#         bge-m3, faze 0a "sample"); cislo = presne tolik ukazek per domena.
+# -TaxonomySamples / $env:TAXONOMY_SAMPLES_PER_DATASET dotaz preskoci; default
+# = hodnota z .env, jinak auto. Bez terminalu se pouzije default.
+function Test-TaxonomySamplesValue {
+    param([string]$Value)
+    return ($Value -eq "auto" -or $Value -match '^[1-9]\d*$')
+}
+
+function Get-DotEnvValue {
+    param([string]$Key)
+    $envFile = if ($env:ENV_FILE) { $env:ENV_FILE } else { ".env" }
+    if (-not (Test-Path $envFile)) { return "" }
+    $val = ""
+    foreach ($line in (Get-Content $envFile)) {
+        if ($line -match "^[ \t]*$Key=(.*)$") { $val = $Matches[1].Trim().Trim('"').Trim("'") }
+    }
+    return $val
+}
+
+function Resolve-TaxonomySamples {
+    param([string]$Given)
+    $v = if ($Given) { $Given } elseif ($env:TAXONOMY_SAMPLES_PER_DATASET) { $env:TAXONOMY_SAMPLES_PER_DATASET } else { "" }
+    $v = $v.Trim().ToLower()
+    if ($v) {
+        if (-not (Test-TaxonomySamplesValue $v)) {
+            Write-Err "TAXONOMY_SAMPLES_PER_DATASET='$v' musi byt 'auto' nebo kladne cele cislo."
+            exit 1
+        }
+        Write-Log "Ukazky pro taxonomii: $v"
+        return $v
+    }
+    $default = (Get-DotEnvValue "TAXONOMY_SAMPLES_PER_DATASET").ToLower()
+    if (-not (Test-TaxonomySamplesValue $default)) { $default = "auto" }
+    if ([Console]::IsInputRedirected) {
+        Write-Log "Neinteraktivni beh -> ukazky pro taxonomii = $default (default)"
+        return $default
+    }
+    Write-Host ""
+    Write-Host "════════════════════════════════════════════════════════"
+    Write-Host "  Kolik ukazek per domena ma dostat LLM pro NAVRH TAXONOMIE?"
+    Write-Host "    auto  = kazda domena si pocet spocita sama podle rozmanitosti"
+    Write-Host "            obsahu (embeddingy BAAI/bge-m3)"
+    Write-Host "    cislo = presne tolik ukazek per domena (co nejruznejsi texty)"
+    Write-Host "════════════════════════════════════════════════════════"
+    while ($true) {
+        $n = Read-Host "Ukazek pro taxonomii per domena [auto/cislo] (Enter = $default)"
+        if (-not $n) { $n = $default }
+        $n = $n.Trim().ToLower()
+        if (Test-TaxonomySamplesValue $n) {
+            Write-Log "OK: ukazky pro taxonomii = $n"
+            return $n
+        }
+        Write-Warning "Neplatna hodnota '$n'. Zadej 'auto' nebo kladne cele cislo."
+    }
+}
+
+$env:TAXONOMY_SAMPLES_PER_DATASET = Resolve-TaxonomySamples -Given $TaxonomySamples
 
 if ([string]::IsNullOrWhiteSpace($HwLabel)) {
-    $HwLabel = "${GpuCount}x B200"
+    $HwLabel = "${GpuCount}x $gpuLabel"
 }
 
 $ExtractorBackends = if ($env:EXTRACTOR_BACKENDS) { $env:EXTRACTOR_BACKENDS -split ' ' } else { @("sglang", "vllm") }
 $CriticBackends    = if ($env:CRITIC_BACKENDS)    { $env:CRITIC_BACKENDS    -split ' ' } else { @("sglang", "vllm") }
 $ReviseBackends    = if ($env:REVISE_BACKENDS)    { $env:REVISE_BACKENDS    -split ' ' } else { @("sglang", "vllm") }
 
-function Write-Log  { param($m) Write-Host "`n==> $m" -ForegroundColor Cyan }
-function Write-Err  { param($m) Write-Host "`n!! $m" -ForegroundColor Red }
-function Write-Warn { param($m) Write-Host "`n!! $m" -ForegroundColor Yellow }
 
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
 function Test-CudaPreflight {
+    # PS 5.1: redirect stderr nativniho prikazu (2>$null / 2>&1) bali radky
+    # do ErrorRecordu; s globalnim $ErrorActionPreference=Stop by PRVNI progress
+    # hlaska dockeru (jde na stderr) shodila skript. Lokalni Continue plati
+    # jen pro tuto funkci.
+    $ErrorActionPreference = "Continue"
     if ($env:SKIP_CUDA_CHECK -eq "1") {
-        Write-Warn "SKIP_CUDA_CHECK=1 — preskakuji CUDA verifikaci."
+        Write-Warn "SKIP_CUDA_CHECK=1 - preskakuji CUDA verifikaci."
         return
     }
     $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if (-not $nvidiaSmi) {
-        Write-Warn "nvidia-smi nenalezen — nemuzu verifikovat CUDA verzi."
+        Write-Warn "nvidia-smi nenalezen - nemuzu verifikovat CUDA verzi."
         return
     }
     $smiOutput = & nvidia-smi 2>$null | Out-String
@@ -208,17 +598,25 @@ function Test-CudaPreflight {
     if (-not $match.Success) { return }
     $major = [int]$match.Groups[1].Value
     $minor = [int]$match.Groups[2].Value
-    if ($major -lt 13) {
-        Write-Err "Detekovana CUDA $major.$minor — pipeline VYZADUJE CUDA 13+ pro NVFP4."
-        Write-Err "Upgrade driveru >=580 a CUDA toolkit >=13.0."
-        throw "CUDA 13+ required (detected $major.$minor)"
+    # CUDA 13+ je potreba jen pro NVFP4 na Blackwellu; A100 (Ampere) jede
+    # INT4/FP8 pres Marlin, kde staci CUDA 12.1+.
+    $minMajor = 13
+    if ($GpuType -eq "a100") { $minMajor = 12 }
+    if ($major -lt $minMajor) {
+        if ($minMajor -eq 12) {
+            Write-Err "Detekovana CUDA $major.$minor - na A100 je potreba CUDA 12.1+ (Marlin INT4/FP8)."
+        } else {
+            Write-Err "Detekovana CUDA $major.$minor - pipeline VYZADUJE CUDA 13+ pro NVFP4."
+            Write-Err "Upgrade driveru >=580 a CUDA toolkit >=13.0."
+        }
+        throw "CUDA ${minMajor}+ required (detected $major.$minor)"
     }
-    Write-Log "Preflight OK — CUDA $major.$minor detekovana (>=13.0)."
+    Write-Log "Preflight OK - CUDA $major.$minor detekovana (>=13.0)."
 }
 
 function Test-DataDir {
     if (-not (Test-Path "data")) {
-        Write-Err "Chybi slozka data/ — nakopiruj tam vstupni JSON soubory"
+        Write-Err "Chybi slozka data/ - nakopiruj tam vstupni JSON soubory"
         throw "data/ missing"
     }
     $jsonCount = (Get-ChildItem -Path "data" -Filter "*.json" -File | Measure-Object).Count
@@ -232,13 +630,38 @@ function Test-DataDir {
 # ---------------------------------------------------------------------------
 # Per-phase smoke runner
 # ---------------------------------------------------------------------------
+function Invoke-ComposeBuild {
+    param([string]$Profile, [string]$Service)
+    # PS 5.1: redirect stderr nativniho prikazu (2>$null / 2>&1) bali radky
+    # do ErrorRecordu; s globalnim $ErrorActionPreference=Stop by PRVNI progress
+    # hlaska dockeru (jde na stderr) shodila skript. Lokalni Continue plati
+    # jen pro tuto funkci.
+    $ErrorActionPreference = "Continue"
+    # Explicitni VIDITELNY build: `docker compose run` sam od sebe nerebuiluje
+    # existujici image (jel by stary kod) a pri prvnim behu by build probihal
+    # skryte na pozadi (stderr je u run -d potlaceny) - vypadalo by to zamrzle.
+    Write-Log "Build image $Service (prvni beh stahuje zavislosti - muze trvat par minut)"
+    docker compose --profile $Profile build $Service
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Build image $Service selhal (rc=$LASTEXITCODE)."
+        return $false
+    }
+    return $true
+}
+
 function Invoke-PhaseViaProfile {
     param(
         [string]$Phase,
         [string]$Profile,
         [string]$LabelerService
     )
-    Write-Log "Smoke FAZE [$Phase] — profile=$Profile (detached -d na pozadi)"
+    # PS 5.1: redirect stderr nativniho prikazu (2>$null / 2>&1) bali radky
+    # do ErrorRecordu; s globalnim $ErrorActionPreference=Stop by PRVNI progress
+    # hlaska dockeru (jde na stderr) shodila skript. Lokalni Continue plati
+    # jen pro tuto funkci.
+    $ErrorActionPreference = "Continue"
+    if (-not (Invoke-ComposeBuild -Profile $Profile -Service $LabelerService)) { return $false }
+    Write-Log "Smoke FAZE [$Phase] - profile=$Profile (detached -d na pozadi)"
     # docker compose run -d prebehne up LLM dependency + spusti override command
     # v detached modu. Vrati container ID, ktery pak cekame pres docker wait.
     $cid = (docker compose --profile $Profile run -d --rm `
@@ -266,7 +689,7 @@ function Invoke-PhaseViaProfile {
 }
 
 # ---------------------------------------------------------------------------
-# NATIVE runtime helpers — bez dockeru, Python proti bezicimu LLM serveru
+# NATIVE runtime helpers - bez dockeru, Python proti bezicimu LLM serveru
 # ---------------------------------------------------------------------------
 # $NativeAutoLlm: 1 (default) = auto-install + auto-start/stop SGLang
 #                 0 = manual (user si LLM zapne sam)
@@ -282,6 +705,8 @@ function Set-NativeEnvParity {
     if (-not $env:EXTRACTOR_BASE_URL)                { $env:EXTRACTOR_BASE_URL = "http://localhost:8000/v1" }
     if (-not $env:CRITIC_BASE_URL)                   { $env:CRITIC_BASE_URL = "http://localhost:8001/v1" }
     if (-not $env:REVISOR_BASE_URL)                  { $env:REVISOR_BASE_URL = $env:EXTRACTOR_BASE_URL }
+    # Embedding server faze 0a (vLLM --runner pooling)
+    if (-not $env:EMBEDDING_BASE_URL)                { $env:EMBEDDING_BASE_URL = "http://localhost:8002/v1" }
     Write-Log "Native env parita: HF_XET=1, PYTHONWARNINGS=suppress,"
     Write-Log "  EXTRACTOR_BASE_URL=$($env:EXTRACTOR_BASE_URL)"
     Write-Log "  CRITIC_BASE_URL=$($env:CRITIC_BASE_URL)"
@@ -292,11 +717,16 @@ function Get-SglangArgsForPhase {
     param([string]$Phase)
     $args = @()
     switch ($Phase) {
-        { $_ -in "extract", "revise" } {
+        { $_ -in "taxonomy", "extract", "revise" } {
             $batch = if ($env:EXTRACTOR_BATCH_SIZE) { $env:EXTRACTOR_BATCH_SIZE } else { "32" }
             $ctx   = if ($env:EXTRACTOR_CONTEXT_LEN) { $env:EXTRACTOR_CONTEXT_LEN } else { "65536" }
             $args  = @("--max-running-requests=$batch", "--context-length=$ctx", "--reasoning-parser=qwen3")
             if ($env:EXTRACTOR_QUANTIZATION) { $args += "--quantization=$($env:EXTRACTOR_QUANTIZATION)" }
+            # Mamba state pool - u hybridniho Qwen3.5 dela strop soubeznosti on,
+            # ne KV cache (viz komentar v docker-compose.yml u extractor-sglang).
+            if ($env:EXTRACTOR_MAX_MAMBA_CACHE) { $args += "--max-mamba-cache-size=$($env:EXTRACTOR_MAX_MAMBA_CACHE)" }
+            if ($env:EXTRACTOR_MAMBA_SSM_DTYPE) { $args += "--mamba-ssm-dtype=$($env:EXTRACTOR_MAMBA_SSM_DTYPE)" }
+            if ($env:EXTRACTOR_MAMBA_RADIX_STRATEGY) { $args += "--mamba-radix-cache-strategy=$($env:EXTRACTOR_MAMBA_RADIX_STRATEGY)" }
             $eff = if ($env:EXTRACTOR_DISABLE_PIECEWISE_CUDA_GRAPH) { $env:EXTRACTOR_DISABLE_PIECEWISE_CUDA_GRAPH } else { $env:DISABLE_PIECEWISE_CUDA_GRAPH }
             if ($eff -eq "1" -or $eff -eq "true") { $args += "--disable-piecewise-cuda-graph" }
         }
@@ -324,6 +754,11 @@ function Test-NativeLlmEndpoint {
 }
 
 function Install-SgLangIfMissing {
+    # PS 5.1: redirect stderr nativniho prikazu (2>$null / 2>&1) bali radky
+    # do ErrorRecordu; s globalnim $ErrorActionPreference=Stop by PRVNI progress
+    # hlaska dockeru (jde na stderr) shodila skript. Lokalni Continue plati
+    # jen pro tuto funkci.
+    $ErrorActionPreference = "Continue"
     try {
         python -c "import sglang" 2>$null
         if ($LASTEXITCODE -eq 0) { return $true }
@@ -352,7 +787,7 @@ function Start-NativeLlmForPhase {
     $model = ""
     $tpSize = 1
     switch ($Phase) {
-        { $_ -in "extract", "revise" } {
+        { $_ -in "taxonomy", "extract", "revise" } {
             $model = if ($env:EXTRACTOR_MODEL) { $env:EXTRACTOR_MODEL } else { "RedHatAI/Qwen3.5-122B-A10B-NVFP4" }
             $tpSize = $GpuCount
         }
@@ -380,9 +815,9 @@ function Stop-NativeLlmForPhase {
     }
 }
 
-# Cleanup hook — pri exit (Ctrl+C, fail, normal) zastav VSECHNY SGLang
+# Cleanup hook - pri exit (Ctrl+C, fail, normal) zastav VSECHNY SGLang
 # servery, ktere jsme my spustili. Iteruje pres PID files misto hardcoded
-# ports — robustni pro budouci rozsireni.
+# ports - robustni pro budouci rozsireni.
 function Invoke-NativeCleanup {
     if ($Runtime -ne "native" -or $NativeAutoLlm -ne "1") { return }
     $LogDir = if ($env:SGLANG_LOG_DIR) { $env:SGLANG_LOG_DIR } else { $env:TEMP }
@@ -395,19 +830,20 @@ function Invoke-NativeCleanup {
         } catch {}
     }
 }
-# PowerShell ekvivalent bash trap EXIT — exit handler pres engine event
+# PowerShell ekvivalent bash trap EXIT - exit handler pres engine event
 Register-EngineEvent PowerShell.Exiting -Action { Invoke-NativeCleanup } | Out-Null
 
 function Invoke-PhaseNative {
     param([string]$Phase)
-    Write-Log "Smoke FAZE [$Phase] — NATIVE (Python primo, zadny docker)"
+    Write-Log "Smoke FAZE [$Phase] - NATIVE (Python primo, zadny docker)"
 
     if ($Phase -ne "finalize" -and $Phase -ne "report") {
         if (-not (Install-SgLangIfMissing)) { return $false }
         $port = switch ($Phase) {
-            "extract" { 8000 }
-            "critic"  { 8001 }
-            "revise"  { 8000 }
+            "taxonomy" { 8000 }
+            "extract"  { 8000 }
+            "critic"   { 8001 }
+            "revise"   { 8000 }
         }
         if (-not (Start-NativeLlmForPhase -Phase $Phase -Port $port)) { return $false }
     }
@@ -419,7 +855,7 @@ function Invoke-PhaseNative {
     $rc = $LASTEXITCODE
 
     if ($Phase -ne "finalize" -and $Phase -ne "report") {
-        $port = switch ($Phase) { "extract" { 8000 } "critic" { 8001 } "revise" { 8000 } }
+        $port = switch ($Phase) { "taxonomy" { 8000 } "extract" { 8000 } "critic" { 8001 } "revise" { 8000 } }
         Stop-NativeLlmForPhase -Port $port
     }
 
@@ -431,8 +867,44 @@ function Invoke-PhaseNative {
     return $false
 }
 
+function Invoke-SmokeSample {
+    Write-Log "FAZE 0a (smoke) - SAMPLE (vyber ukazek pro taxonomii, embeddingy bge-m3 na vLLM)"
+    if ($Runtime -eq "native") {
+    # Embedding server faze 0a bezi na vLLM, ktery na Windows nativne nebezi
+    # (jen Linux) -> v native rezimu se faze preskoci; taxonomie pouzije
+    # nahodny vyber. Pro embeddingy pust Docker runtime (nebo WSL + run_*.sh).
+        Write-Warn "Native runtime: vLLM na Windows nebezi - faze sample preskocena, taxonomie pouzije nahodny vyber."
+        return $true
+    }
+    $ok = $false
+    try {
+        $ok = Invoke-PhaseViaProfile -Phase "sample" -Profile "embed-vllm" -LabelerService "labeler-embed-vllm"
+    } catch { $ok = $false }
+    if (-not $ok) {
+        Write-Warn "Vyber ukazek pres embeddingy selhal - taxonomie pouzije nahodny vyber."
+    }
+    return $true
+}
+
+function Invoke-SmokeTaxonomy {
+    Write-Log "FAZE 0 (smoke) - TAXONOMY (auto-discovery + embeddingy)"
+    if ($Runtime -eq "native") {
+        if (-not (Invoke-PhaseNative -Phase "taxonomy")) { throw "taxonomy failed (native)" }
+        return
+    }
+    # Taxonomy pouziva extractor LLM -> bezi pres extractor profily
+    foreach ($backend in $ExtractorBackends) {
+        if (Invoke-PhaseViaProfile -Phase "taxonomy" -Profile "extract-$backend" -LabelerService "labeler-extract-$backend") {
+            return $true
+        }
+        Write-Warn "Backend $backend selhal pro taxonomy, zkousim dalsi..."
+    }
+    Write-Err "Vsechny taxonomy backendy selhaly."
+    throw "taxonomy failed"
+}
+
 function Invoke-SmokeExtract {
-    Write-Log "FAZE 1 (smoke) — EXTRACT"
+    Write-Log "FAZE 1 (smoke) - EXTRACT"
     if ($Runtime -eq "native") {
         if (-not (Invoke-PhaseNative -Phase "extract")) { throw "extract failed (native)" }
         return
@@ -448,7 +920,7 @@ function Invoke-SmokeExtract {
 }
 
 function Invoke-SmokeCritic {
-    Write-Log "FAZE 2 (smoke) — CRITIC"
+    Write-Log "FAZE 2 (smoke) - CRITIC"
     if ($Runtime -eq "native") {
         if (-not (Invoke-PhaseNative -Phase "critic")) { throw "critic failed (native)" }
         return
@@ -464,7 +936,7 @@ function Invoke-SmokeCritic {
 }
 
 function Invoke-SmokeRevise {
-    Write-Log "FAZE 2b (smoke) — REVISE"
+    Write-Log "FAZE 2b (smoke) - REVISE"
     if ($Runtime -eq "native") {
         if (-not (Invoke-PhaseNative -Phase "revise")) { throw "revise failed (native)" }
         return
@@ -480,11 +952,17 @@ function Invoke-SmokeRevise {
 }
 
 function Invoke-SmokeFinalize {
-    Write-Log "FAZE 3 (smoke) — FINALIZE (bez LLM, detached -d)"
+    # PS 5.1: redirect stderr nativniho prikazu (2>$null / 2>&1) bali radky
+    # do ErrorRecordu; s globalnim $ErrorActionPreference=Stop by PRVNI progress
+    # hlaska dockeru (jde na stderr) shodila skript. Lokalni Continue plati
+    # jen pro tuto funkci.
+    $ErrorActionPreference = "Continue"
+    Write-Log "FAZE 3 (smoke) - FINALIZE (bez LLM, detached -d)"
     if ($Runtime -eq "native") {
         if (-not (Invoke-PhaseNative -Phase "finalize")) { throw "finalize failed (native)" }
         return
     }
+    if (-not (Invoke-ComposeBuild -Profile "finalize" -Service "labeler-finalize")) { throw "finalize failed" }
     $cid = (docker compose --profile finalize run -d --rm `
         -e SMOKE_CHECKPOINT_DIR=/app/checkpoints/smoke `
         labeler-finalize `
@@ -507,11 +985,17 @@ function Invoke-SmokeFinalize {
 }
 
 function Invoke-SmokeReport {
-    Write-Log "FAZE 4 (smoke) — REPORT (extrapolace + +/-2h konfidence)"
+    # PS 5.1: redirect stderr nativniho prikazu (2>$null / 2>&1) bali radky
+    # do ErrorRecordu; s globalnim $ErrorActionPreference=Stop by PRVNI progress
+    # hlaska dockeru (jde na stderr) shodila skript. Lokalni Continue plati
+    # jen pro tuto funkci.
+    $ErrorActionPreference = "Continue"
+    Write-Log "FAZE 4 (smoke) - REPORT (extrapolace + +/-2h konfidence)"
     if ($Runtime -eq "native") {
         if (-not (Invoke-PhaseNative -Phase "report")) { throw "report failed (native)" }
         return
     }
+    if (-not (Invoke-ComposeBuild -Profile "finalize" -Service "labeler-finalize")) { throw "report failed" }
     $cid = (docker compose --profile finalize run -d --rm `
         -e SMOKE_CHECKPOINT_DIR=/app/checkpoints/smoke `
         labeler-finalize `
@@ -539,11 +1023,13 @@ New-Item -ItemType Directory -Force -Path "checkpoints/smoke" | Out-Null
 
 Write-Log "Smoke test config:"
 Write-Host "  Runtime=$Runtime"
-Write-Host "  GpuCount=$($GpuCount)x B200"
+Write-Host "  GpuType=$GpuType"
+Write-Host "  GpuCount=$($GpuCount)x $gpuLabel"
 Write-Host "  EXTRACTOR_TP_SIZE=$($env:EXTRACTOR_TP_SIZE)"
 Write-Host "  CRITIC_TP_SIZE=$($env:CRITIC_TP_SIZE)"
 Write-Host "  HwLabel=$HwLabel"
 Write-Host "  SamplesPerDataset=$SamplesPerDataset"
+Write-Host "  TAXONOMY_SAMPLES_PER_DATASET=$($env:TAXONOMY_SAMPLES_PER_DATASET)"
 Write-Host "  SmokePhases=$($SmokePhases -join ',')"
 Write-Host "  DockerStartupS=$DockerStartupS"
 if ($Runtime -eq "native") {
@@ -563,6 +1049,8 @@ if ($Runtime -eq "native") {
 
 foreach ($phase in $SmokePhases) {
     switch ($phase) {
+        "sample"   { Invoke-SmokeSample   | Out-Null }
+        "taxonomy" { Invoke-SmokeTaxonomy | Out-Null }
         "extract"  { Invoke-SmokeExtract  | Out-Null }
         "critic"   { Invoke-SmokeCritic   | Out-Null }
         "revise"   { Invoke-SmokeRevise   | Out-Null }
@@ -579,6 +1067,6 @@ Invoke-SmokeReport
 Write-Log "Smoke test hotov."
 Write-Host ""
 Write-Host "Artefakty:"
-Write-Host "  checkpoints/smoke/smoke_timings.json     — raw per-fazova mereni"
-Write-Host "  checkpoints/smoke/smoke_test_report.md   — human-readable report"
-Write-Host "  checkpoints/smoke/smoke_test_report.json — strojovy export"
+Write-Host "  checkpoints/smoke/smoke_timings.json     - raw per-fazova mereni"
+Write-Host "  checkpoints/smoke/smoke_test_report.md   - human-readable report"
+Write-Host "  checkpoints/smoke/smoke_test_report.json - strojovy export"

@@ -19,7 +19,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterable, Iterator, Optional, Union
+
+from .config import CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -165,21 +167,91 @@ _STAGE_SKIP_PROTOTYPE_SUBSTRINGS = (
     "register",
 )
 
+# Typy objektů bez věcného textu — v2 exporty míchají stránky a soubory v jednom
+# schématu (objectType edeePage / edeeFile). Substring v `objectType`
+# (case-insensitive), stejná politika jako _STAGE_SKIP_SCHEMA_SUBSTRINGS.
+_STAGE_SKIP_OBJECT_TYPE_SUBSTRINGS = ("file",)
 
-def _stage_record_fields_to_dict(rec: dict) -> dict[str, str]:
-    """Z Stage záznamu {id, fields:[{code, value}]} udělá flat dict {code: value}."""
-    out: dict[str, str] = {}
+
+# ---------------------------------------------------------------------------
+# Výběr jazyků (locale)
+# ---------------------------------------------------------------------------
+
+LocalesArg = Union[str, Iterable[str], None]
+
+
+def _norm_locale(loc: str) -> str:
+    return loc.strip().lower().replace("_", "-")
+
+
+_ALL_LOCALES = {"*", "all"}
+
+
+def parse_locales(value: LocalesArg) -> Optional[frozenset[str]]:
+    """
+    "cs, sk" / ["cs", "sk"] → frozenset({"cs", "sk"}) (normalizované).
+    "*" / "all" / prázdná hodnota / None → None = bez filtru (všechny jazyky).
+    """
+    if value is None:
+        return None
+    parts = re.split(r"[,;\s]+", value) if isinstance(value, str) else value
+    out = frozenset(_norm_locale(str(p)) for p in parts if p and str(p).strip())
+    if not out or out & _ALL_LOCALES:
+        return None
+    return out
+
+
+def _locale_selected(loc: str, selected: Optional[frozenset[str]]) -> bool:
+    """True, pokud locale patří do výběru. Výběr "cs" matchuje i "cs-CZ" / "cs_CZ"."""
+    if not selected:
+        return True
+    n = _norm_locale(loc)
+    return n in selected or n.split("-", 1)[0] in selected
+
+
+def _stage_field_value(fld: dict) -> Optional[str]:
+    """Hodnota Stage fieldu jako string. REFERENCE pole (list ID) → "id1, id2"."""
+    val = fld.get("value")
+    if val is None:
+        val = fld.get("values")
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val if v is not None)
+    return str(val)
+
+
+def _stage_record_locale_views(
+    rec: dict, schema_locales: list[str]
+) -> list[tuple[Optional[str], dict[str, str]]]:
+    """
+    Rozloží Stage záznam {id, fields:[{code, value, locale}]} na jazykové verze
+    [(locale, {code: value})].
+
+    Pole s `locale: null` (nelokalizovaná) jsou v každé verzi, lokalizovaná pole
+    jen ve verzi svého jazyka. Záznam bez lokalizovaných polí (i v1 exporty bez
+    `locale`) → jediná verze s locale = jediný allowedLocale schématu, jinak None.
+    """
+    shared: dict[str, str] = {}
+    per_locale: dict[str, dict[str, str]] = {}
     for fld in rec.get("fields", []) or []:
         code = fld.get("code") or fld.get("name")
         if not code:
             continue
-        val = fld.get("value")
-        if val is None:
-            val = fld.get("values")
+        val = _stage_field_value(fld)
         if val is None:
             continue
-        out[code] = val if isinstance(val, str) else str(val)
-    return out
+        loc = fld.get("locale")
+        if loc:
+            per_locale.setdefault(loc, {})[code] = val
+        else:
+            shared[code] = val
+
+    if not per_locale:
+        return [(schema_locales[0] if len(schema_locales) == 1 else None, shared)]
+    return [(loc, {**shared, **fields}) for loc, fields in per_locale.items()]
 
 
 def _stage_is_skipped_prototype(prototype: str) -> bool:
@@ -187,6 +259,14 @@ def _stage_is_skipped_prototype(prototype: str) -> bool:
         return False
     p = prototype.lower()
     return any(sub in p for sub in _STAGE_SKIP_PROTOTYPE_SUBSTRINGS)
+
+
+def _stage_is_skipped_record(fields: dict[str, str]) -> bool:
+    """Navigační/systémový prototyp nebo objekt bez textu (soubor) → nelabelovat."""
+    if _stage_is_skipped_prototype(fields.get("prototype", "")):
+        return True
+    object_type = fields.get("objectType", "").lower()
+    return any(sub in object_type for sub in _STAGE_SKIP_OBJECT_TYPE_SUBSTRINGS)
 
 
 def _stage_compose_product_text(fields: dict[str, str]) -> tuple[str, str]:
@@ -237,11 +317,26 @@ def _stage_compose_product_text(fields: dict[str, str]) -> tuple[str, str]:
     return primary, "\n".join(ctx_parts) if ctx_parts else ""
 
 
+# Pole, která obsahují hlavní text článku — v prioritě (v1 Stage: 'content',
+# zpravodajské exporty: 'body'). První nenalezené pole se ignoruje.
+_PAGE_TEXT_FIELDS = ("content", "body")
+
+
 def _stage_compose_page_text(fields: dict[str, str]) -> tuple[str, str]:
     """
     Pro page/news/blog/faq sestaví hlavní text + kontext.
+
+    Hlavní text hledá v polích `_PAGE_TEXT_FIELDS` (content, body) —
+    podpoří tak i zpravodajské exporty, kde je text v `body`.
+    Kontext: title, perex (zpravodajské exporty), kategorie, autoři.
     """
-    content = strip_html(fields.get("content", "")).strip()
+    content = ""
+    for fld in _PAGE_TEXT_FIELDS:
+        val = fields.get(fld, "")
+        if val:
+            content = strip_html(val).strip()
+            if content:
+                break
     if len(content) < STAGE_MIN_TEXT_LEN:
         return "", ""
 
@@ -249,10 +344,30 @@ def _stage_compose_page_text(fields: dict[str, str]) -> tuple[str, str]:
     if _looks_like_navigation(content):
         return "", ""
 
-    title = strip_html(fields.get("title", "")).strip()
     ctx_parts = []
+    title = strip_html(fields.get("title", "")).strip()
     if title and title not in content:
         ctx_parts.append(f"Titulek: {title}")
+    perex = strip_html(fields.get("perex", "")).strip()
+    if perex and perex not in content:
+        ctx_parts.append(f"Perex: {perex}")
+    # kategorie — zpravodajské exporty: list[str], ostatní: string
+    cats_raw = fields.get("category_names") or fields.get("categories") or ""
+    if isinstance(cats_raw, list):
+        cats = ", ".join(str(c) for c in cats_raw if c)
+    else:
+        cats = str(cats_raw).strip()
+    if cats:
+        ctx_parts.append(f"Kategorie: {cats}")
+    # autoři
+    authors_raw = fields.get("authors") or ""
+    if isinstance(authors_raw, list):
+        authors = ", ".join(str(a) for a in authors_raw if a)
+    else:
+        authors = str(authors_raw).strip()
+    if authors:
+        ctx_parts.append(f"Autoři: {authors}")
+
     return content, "\n".join(ctx_parts) if ctx_parts else ""
 
 
@@ -260,30 +375,44 @@ def iter_stage_export(
     path: Path,
     *,
     domain_override: Optional[str] = None,
+    locales: LocalesArg = None,
     limit: Optional[int] = None,
 ) -> Iterator[LabelItem]:
     """
     Univerzální reader pro Stage export soubory typu `export-*-latest.json`.
 
-    Struktura:
+    Struktura (v1 i v2):
       root = {
-        version: 1, exportedAt: "...",
+        version: 1|2, mode: "EMBEDDED" (v2), exportedAt: "...",
         dataset: {name, path, description},
         schemas: [
           {
             name, code, allowedLocales: [...],
-            fields:  [{code, name, type, ...}],          # definice fieldů
-            records: [{id, fields: [{code, value}]}]     # data
+            fields:    [{code, name, type, localized, ...}],   # definice fieldů
+            relations: [{fieldCode, targetSchemaCode, ...}],   # v2
+            records: [{
+              id,
+              fields:  [{code, value, locale}],   # value: str | list[str] (REFERENCE)
+              related: [...]                      # v2, embedded vazby — ignoruje se
+            }]
           }
         ]
       }
+
+    Jazyky: `locales` (např. "cs,sk" nebo ["cs"]; None / "*" = všechny). Schéma,
+    jehož allowedLocales nemá s výběrem průnik, se přeskočí celé. Lokalizovaná
+    pole (`locale` != null) jiných jazyků se ignorují; záznam dostupný jen
+    v jiných jazycích se přeskočí. Záznam s více vybranými jazyky dá jednu
+    verzi per jazyk — item_id pak nese suffix "@{locale}" (jen u vícejazyčných
+    schémat/záznamů, jednojazyčná zůstávají beze změny).
 
     Pro každý record vybere POUZE věcný obsah pro NER/RE/triples:
       - produkty/kategorie/brands → description (fallback descriptionShort, pak
         synthetic z name+parameters)
       - stránky/news/blog → content (s odfiltrováním navigace a krátkých
         nicneříkajících záznamů)
-      - soubory (cs-files, sk-files atd.) → SKIP (jen názvy a URL, žádný obsah)
+      - soubory (cs-files, sk-files atd., objectType edeeFile) → SKIP (jen
+        názvy a URL, žádný obsah)
       - system/banner/header/footer prototypy → SKIP
 
     Doména je defaultně DEFAULT_STAGE_DOMAIN; per soubor ji přepíšeš přes
@@ -301,17 +430,23 @@ def iter_stage_export(
         return
 
     domain = domain_override or DEFAULT_STAGE_DOMAIN
+    selected = parse_locales(locales)
     logger.info(
-        f"Stage export {dataset_name!r}: {len(schemas)} schémat, doména='{domain}'"
+        f"Stage export {dataset_name!r}: {len(schemas)} schémat, doména='{domain}', "
+        f"jazyky={sorted(selected) if selected else 'všechny'}"
     )
 
     produced = 0
     skipped_empty = 0
     skipped_nav = 0
     skipped_short = 0
+    skipped_locale = 0
     skipped_schemas: list[str] = []
+    skipped_locale_schemas: list[str] = []
 
     for schema in schemas:
+        if limit is not None and produced >= limit:
+            break
         schema_code = (schema.get("code") or schema.get("name") or "").strip()
         if not schema_code:
             continue
@@ -322,75 +457,123 @@ def iter_stage_export(
             skipped_schemas.append(schema_code)
             continue
 
+        schema_locales = [
+            loc for loc in (schema.get("allowedLocales") or [])
+            if isinstance(loc, str) and loc.strip()
+        ]
+        if selected and schema_locales and not any(
+            _locale_selected(loc, selected) for loc in schema_locales
+        ):
+            skipped_locale_schemas.append(schema_code)
+            continue
+
         records = schema.get("records", []) or []
         if not records:
             continue
 
-        # Detekuj typ schématu: produkty mají 'description'+'descriptionShort'+'name',
-        # stránky mají 'content'+'title'.
-        sample_fields = (
-            set(_stage_record_fields_to_dict(records[0]).keys()) if records else set()
-        )
-        is_product_like = "description" in sample_fields or "descriptionShort" in sample_fields
-        is_page_like = "content" in sample_fields
+        # Typ schématu (produkty: 'description'/'descriptionShort', stránky:
+        # 'content') se určí z prvního nepřeskočeného záznamu — v2 schémata
+        # míchají stránky se soubory, records[0] proto nestačí.
+        is_product_like: Optional[bool] = None
+        is_page_like = False
 
         for rec in records:
             if limit is not None and produced >= limit:
                 break
 
-            fields = _stage_record_fields_to_dict(rec)
+            all_views = _stage_record_locale_views(rec, schema_locales)
+            views = [
+                (loc, fields) for loc, fields in all_views
+                if loc is None or _locale_selected(loc, selected)
+            ]
+            if not views:
+                skipped_locale += 1
+                continue
 
-            # SKIP system/banner prototypy (stránky)
-            prototype = fields.get("prototype", "")
-            if _stage_is_skipped_prototype(prototype):
+            # prototype / objectType jsou nelokalizované → stejné ve všech verzích
+            if _stage_is_skipped_record(views[0][1]):
                 skipped_nav += 1
                 continue
 
-            # Vyber správný skladač podle typu schématu
-            if is_product_like:
-                primary, context = _stage_compose_product_text(fields)
-            elif is_page_like:
-                primary, context = _stage_compose_page_text(fields)
-            else:
-                primary, context = "", ""
-
-            if not primary:
-                if is_page_like and len(strip_html(fields.get("content", ""))) > 0:
-                    skipped_short += 1
-                else:
-                    skipped_empty += 1
-                continue
-
-            record_id = (
-                fields.get("externalId")
-                or fields.get("id")
-                or rec.get("id")
-                or f"row{produced}"
-            )
-
-            chunks = split_into_chunks(primary)
-            for i, chunk in enumerate(chunks):
-                base_id = f"{dataset_name}:{schema_code}:{record_id}"
-                chunk_id = base_id if len(chunks) == 1 else f"{base_id}#chunk{i}"
-                yield LabelItem(
-                    item_id=chunk_id,
-                    source=dataset_name,
-                    domain=domain,
-                    text=chunk,
-                    context=context or None,
-                    is_synthetic=False,
-                    original_id=str(record_id),
-                    chunk_index=i if len(chunks) > 1 else None,
-                    total_chunks=len(chunks) if len(chunks) > 1 else None,
-                    extra={
-                        "schema": schema_code,
-                        "prototype": prototype or None,
-                        "source_file": path.name,
-                    },
+            # Typ schématu se určí z PRVNÍHO záznamu s věcným textem — některé
+            # schémata začínají záznamy bez textu (např. zpravodajský záznam bez 'body'),
+            # records[0] proto nestačí.
+            if is_product_like is None:
+                sample_fields = views[0][1].keys()
+                has_product_fields = (
+                    "description" in sample_fields or "descriptionShort" in sample_fields
                 )
-                produced += 1
+                has_page_fields = any(f in sample_fields for f in _PAGE_TEXT_FIELDS)
+                if has_product_fields or has_page_fields:
+                    is_product_like = has_product_fields
+                    is_page_like = has_page_fields
+                # jinak: typ neznámý, prozkoumáme další záznam
+
+            # Suffix @locale jen u vícejazyčných schémat/záznamů; nezávisí na
+            # výběru jazyků → stabilní item_id napříč běhy s různým DATA_LOCALES.
+            tag_locale = len(schema_locales) > 1 or len(all_views) > 1
+            seen_texts: set[str] = set()
+
+            for loc, fields in views:
                 if limit is not None and produced >= limit:
                     break
+
+                # Vyber správný skladač podle typu schématu
+                if is_product_like:
+                    primary, context = _stage_compose_product_text(fields)
+                elif is_page_like:
+                    primary, context = _stage_compose_page_text(fields)
+                else:
+                    primary, context = "", ""
+
+                if not primary:
+                    has_text = any(
+                        len(strip_html(fields.get(f, ""))) > 0 for f in _PAGE_TEXT_FIELDS
+                    )
+                    if is_page_like and has_text:
+                        skipped_short += 1
+                    else:
+                        skipped_empty += 1
+                    continue
+                # Jazykové verze sdílející jen nelokalizovaný text → labelovat jednou
+                if primary in seen_texts:
+                    continue
+                seen_texts.add(primary)
+
+                record_id = (
+                    fields.get("externalId")
+                    or fields.get("id")
+                    or rec.get("id")
+                    or f"row{produced}"
+                )
+                base_id = f"{dataset_name}:{schema_code}:{record_id}"
+                if loc and tag_locale:
+                    base_id = f"{base_id}@{loc}"
+                prototype = fields.get("prototype", "")
+
+                chunks = split_into_chunks(primary)
+                for i, chunk in enumerate(chunks):
+                    chunk_id = base_id if len(chunks) == 1 else f"{base_id}#chunk{i}"
+                    yield LabelItem(
+                        item_id=chunk_id,
+                        source=dataset_name,
+                        domain=domain,
+                        text=chunk,
+                        context=context or None,
+                        is_synthetic=False,
+                        original_id=str(record_id),
+                        chunk_index=i if len(chunks) > 1 else None,
+                        total_chunks=len(chunks) if len(chunks) > 1 else None,
+                        extra={
+                            "schema": schema_code,
+                            "prototype": prototype or None,
+                            "locale": loc,
+                            "source_file": path.name,
+                        },
+                    )
+                    produced += 1
+                    if limit is not None and produced >= limit:
+                        break
 
     if skipped_schemas:
         logger.info(
@@ -398,10 +581,16 @@ def iter_stage_export(
             f"(jen názvy souborů / bez věcného obsahu): {skipped_schemas[:6]}"
             f"{'...' if len(skipped_schemas) > 6 else ''}"
         )
+    if skipped_locale_schemas:
+        logger.info(
+            f"Stage {dataset_name}: skipped {len(skipped_locale_schemas)} schémat "
+            f"(jiný jazyk): {skipped_locale_schemas[:6]}"
+            f"{'...' if len(skipped_locale_schemas) > 6 else ''}"
+        )
     logger.info(
         f"Stage {dataset_name}: vyprodukováno {produced} label items, "
         f"přeskočeno {skipped_empty} (bez obsahu) + {skipped_nav} (navigace/system) "
-        f"+ {skipped_short} (krátký text)"
+        f"+ {skipped_short} (krátký text) + {skipped_locale} (jiný jazyk)"
     )
 
 
@@ -409,7 +598,9 @@ def _is_stage_export(path: Path) -> bool:
     """Zjistí, zda JSON soubor je Stage export (klíče version + schemas + dataset)."""
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
-            head = f.read(512)  # stačí jen úvod, schemas list je vždy potom
+            # Úvod souboru — schemas list je vždy až za dataset metadaty, ale
+            # dataset.description může mít stovky znaků (v2 exporty), 512 nestačí.
+            head = f.read(65536)
         # Rychlý sniff bez parsování celého souboru
         return (
             '"version"' in head
@@ -441,6 +632,9 @@ def load_data_config(data_dir: Path) -> dict[str, dict]:
         },
         "inzeraty.json": {
           "domain": "realitní inzeráty"
+        },
+        "export-nabytek-demo-latest.json": {
+          "locales": ["sk"]            # jen Stage exporty; přepíše DATA_LOCALES
         }
       }
 
@@ -466,6 +660,7 @@ def scan_data_dir(
     data_dir: Path,
     *,
     default_domain: Optional[str] = None,
+    locales: LocalesArg = None,
     limit: Optional[int] = None,
 ) -> Iterator[LabelItem]:
     """
@@ -479,12 +674,17 @@ def scan_data_dir(
       - cokoli jiného → iter_generic_json (univerzální dict/list reader)
 
     Konfigurace (volitelná) v souboru labeler_config.json:
-      Umožňuje nastavit domain, text_field, id_field, context_fields per soubor.
-      Pokud soubor chybí, vše se auto-detekuje nebo použije název souboru jako doménu.
+      Umožňuje nastavit domain, text_field, id_field, context_fields, locales
+      per soubor. Pokud soubor chybí, vše se auto-detekuje nebo použije název
+      souboru jako doménu.
 
     Parametry:
       data_dir:       Složka se vstupními JSON soubory (CONFIG.data_dir).
       default_domain: Pokud je zadáno, přepíše doménu pro všechny generické soubory.
+      locales:        Jazyky načítané ze Stage exportů ("cs,sk" / ["cs"]).
+                      None → CONFIG.data_locales (env DATA_LOCALES, default
+                      "cs"); "*" = všechny. Klíč "locales" v labeler_config.json
+                      má přednost.
       limit:          Max. počet LabelItem per soubor (pro dry run).
     """
     if not data_dir.exists():
@@ -492,6 +692,7 @@ def scan_data_dir(
         return
 
     file_config = load_data_config(data_dir)
+    global_locales = locales if locales is not None else CONFIG.data_locales
 
     json_files = sorted(data_dir.glob("*.json"))
     json_files = [f for f in json_files if f.name != _CONFIG_FILENAME and not f.name.startswith(".")]
@@ -514,6 +715,7 @@ def scan_data_dir(
             yield from iter_stage_export(
                 json_path,
                 domain_override=domain_override,
+                locales=per_file.get("locales", global_locales),
                 limit=limit,
             )
             continue

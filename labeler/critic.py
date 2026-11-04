@@ -39,22 +39,29 @@ async def _critique_one(
     extraction: ExtractorResult,
     *,
     max_tokens: int,
+    taxonomy=None,
 ) -> Optional[CriticResult]:
     """
     Zavolá critic s novou "session" (žádný shared context s extractorem).
     Vrací CriticResult (BEZ extractor_revised — to doplní revise fáze).
+
+    `taxonomy` MUSÍ být ta samá taxonomie, podle které běžel extractor —
+    jinak critic považuje platné labely za neexistující kategorie a přepíše je.
     """
     # Split NER/RE (default ON): validace entit a relací zvlášť, merge do
     # jednoho CriticResult (formát beze změny).
     if CONFIG.split_ner_re:
         from .ner_re_split import critique_split
 
-        return await critique_split(client, extraction, max_tokens=max_tokens)
+        return await critique_split(
+            client, extraction, max_tokens=max_tokens, taxonomy=taxonomy,
+        )
 
     messages = build_critic_messages(
         text=extraction.input_text,
         proposed=extraction.graph.model_dump(mode="json", exclude={"triples"}),
         context=extraction.context,
+        taxonomy=taxonomy,
     )
 
     try:
@@ -153,6 +160,7 @@ async def run_critic(
     dry_run_limit: Optional[int] = None,
     skip_synthetic: bool = False,
     only_synthetic: bool = False,
+    taxonomy=None,
 ) -> None:
     """
     Hlavní loop fáze 2 — pouze critic (Gemma).
@@ -189,12 +197,14 @@ async def run_critic(
         max_concurrency=CONFIG.critic_concurrency,
         request_timeout=CONFIG.request_timeout_s,
         max_retries=CONFIG.max_retries,
+        context_len=CONFIG.critic_context_len,
     ) as critic_client:
         await critic_client.wait_ready(max_wait_s=1200)
         await _run_critic_branches(
             branches=branches,
             critic_client=critic_client,
             dry_run_limit=dry_run_limit,
+            taxonomy=taxonomy,
         )
 
 
@@ -203,6 +213,7 @@ async def _run_critic_branches(
     branches: list[tuple[str, bool]],
     critic_client: LLMClient,
     dry_run_limit: Optional[int],
+    taxonomy=None,
 ) -> None:
     for label, is_synth in branches:
         input_path = extraction_path(synthetic=is_synth)
@@ -252,6 +263,7 @@ async def _run_critic_branches(
                             critic_client,
                             ex,
                             max_tokens=CONFIG.critic_max_tokens,
+                            taxonomy=taxonomy,
                         )
                         if result is None:
                             tracker.tick(error=True)

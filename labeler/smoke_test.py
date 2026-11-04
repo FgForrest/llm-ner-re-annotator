@@ -640,13 +640,20 @@ def compute_estimate(
     # Taxonomy auto-discovery je JEDNORÁZOVÁ konstanta: sampluje fixní počet
     # vzorků nezávisle na velikosti datasetu, takže se NEškáluje na full rozsah.
     # Pokud byla změřena, přičteme naměřený wall-clock přímo (T_full = T_smoke).
-    tax_phase = phases.get("taxonomy")
-    if tax_phase:
+    # Fáze 0a (výběr vzorků přes embeddingy) je taky jednorázová konstanta —
+    # kóduje se nejvýš TAXONOMY_SAMPLE_POOL_MAX textů per doména.
+    for const_phase, const_label in (
+        ("sample", "Sample (fáze 0a, embeddingy)"),
+        ("taxonomy", "Taxonomy (fáze 0)"),
+    ):
+        tax_phase = phases.get(const_phase)
+        if not tax_phase:
+            continue
         tax_wall = tax_phase.get("wall_clock_s", 0.0) or 0.0
         if tax_wall > 0:
-            breakdown["taxonomy"] = tax_wall
+            breakdown[const_phase] = tax_wall
             notes.append(
-                f"Taxonomy (fáze 0) jednorázová konstanta: {tax_wall:.0f}s "
+                f"{const_label} jednorázová konstanta: {tax_wall:.0f}s "
                 f"(neškáluje se s rozsahem — fixní vzorkování datasetů)"
             )
             tax_per_item = list(tax_phase.get("per_item_times_s", []) or [])
@@ -775,16 +782,19 @@ def format_report_markdown(report: SmokeTestReport) -> str:
     lines.append("")
     lines.append("| Fáze | Items | Input chars | Wall clock | Per item | Per 1k char |")
     lines.append("|------|------:|------------:|-----------:|---------:|------------:|")
-    for phase_name in ("taxonomy", "extract", "critic", "revise", "finalize"):
+    for phase_name in ("sample", "taxonomy", "extract", "critic", "revise", "finalize"):
         p = report.phases.get(phase_name)
-        if phase_name == "taxonomy":
-            # Fáze 0 je jednorázová konstanta — sampluje fixní počet vzorků,
-            # takže items/chars/per-item nedávají smysl; zobrazíme jen wall.
+        if phase_name in ("sample", "taxonomy"):
+            # Fáze 0a / 0 jsou jednorázové konstanty — items/chars/per-item
+            # nedávají smysl; zobrazíme jen wall.
+            label = "sample (fáze 0a)" if phase_name == "sample" else "taxonomy (fáze 0)"
+            if phase_name == "sample" and (not p or p.wall_clock_s <= 0):
+                continue  # fáze 0a je volitelná — bez měření řádek vynech
             if not p or p.wall_clock_s <= 0:
-                lines.append("| taxonomy (fáze 0) | — | — | (nespuštěno) | — | — |")
+                lines.append(f"| {label} | — | — | (nespuštěno) | — | — |")
             else:
                 lines.append(
-                    f"| taxonomy (fáze 0) | — | — | "
+                    f"| {label} | — | — | "
                     f"{_fmt_duration(p.wall_clock_s)} | — | — |"
                 )
             continue

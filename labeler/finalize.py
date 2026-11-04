@@ -117,6 +117,102 @@ def _write_final_outputs(jsonl_path: Path, records: list[dict]) -> tuple[Path, P
 
 
 # ---------------------------------------------------------------------------
+# Oddělení keyphrase entit od hlavního datasetu (FINAL_EXCLUDE_KEYPHRASES)
+# ---------------------------------------------------------------------------
+
+
+def _is_keyphrase_category(category: Any) -> bool:
+    """Keyphrase = kategorie po normalizaci s prefixem KEYPHRASE_ (kind=keyphrase
+    v taxonomii, remap_to KEYPHRASE_*, downgrade unsafe_texts na KEYPHRASE_SUBJECT)."""
+    return str(category or "").startswith("KEYPHRASE_")
+
+
+# Obecná slova z unsafe_texts (normalize je záměrně vyřadil z entitních tříd) —
+# relace na ně se NEZACHOVÁVAJÍ, byly by nesmyslné ("PRODUKT has_benefit pojištění").
+_GENERIC_KEYPHRASE = "KEYPHRASE_SUBJECT"
+
+
+def _split_keyphrases(record: dict) -> tuple[dict, dict]:
+    """
+    Oddělí keyphrase entity od NER grafu, ale relace NEZAHODÍ.
+
+    Výsledný záznam:
+      graph       NER entity (bez keyphrase) + relace jen mezi nimi + triples —
+                  čistá data pro NER trénink (záznam bez entit = platný
+                  negativní příklad, text zůstává)
+      keyphrases  {"entities", "relations", "triples"} — keyphrase entity
+                  s platnou pozicí a relace, které se jich týkají. Relace
+                  odkazují na id z graph.entities i keyphrases.entities (id
+                  jsou v rámci záznamu unikátní) → pro RE trénink spoj obojí.
+
+    Relace s keyphrase koncem se zachová JEN když je bezpečná:
+      - oba konce existují, nejde o smyčku ani duplicitu,
+      - aspoň jeden konec je NER entita (keyphrase ↔ keyphrase = šum),
+      - keyphrase konec není KEYPHRASE_SUBJECT (obecné slovo) a má platný
+        span v textu.
+    Vrací (záznam, statistika) — záznam bez keyphrase se nemění.
+    """
+    stats: Counter[str] = Counter()
+    graph = record.get("graph") or {}
+    entities = graph.get("entities") or []
+    relations = graph.get("relations") or []
+    key_ids = {e["id"] for e in entities if _is_keyphrase_category(e.get("category"))}
+    if not key_ids:
+        return record, stats
+
+    text = record.get("input_text", "")
+    by_id = {e["id"]: e for e in entities}
+    main_ents = [e for e in entities if e["id"] not in key_ids]
+    main_rels, kp_rels, seen = [], [], set()
+    for r in relations:
+        s, o = r.get("subjectId"), r.get("objectId")
+        if s not in key_ids and o not in key_ids:
+            main_rels.append(r)
+            continue
+        kp_ends = [by_id[x] for x in (s, o) if x in key_ids]
+        if s not in by_id or o not in by_id:
+            reason = "dangling"
+        elif s == o:
+            reason = "self_loop"
+        elif len(kp_ends) == 2:
+            reason = "keyphrase_to_keyphrase"
+        elif any(e.get("category") == _GENERIC_KEYPHRASE for e in kp_ends):
+            reason = "generic_keyphrase"
+        elif not all(_entity_has_valid_span(e, text) for e in kp_ends):
+            reason = "invalid_span"
+        elif (s, r.get("relation"), o) in seen:
+            reason = "duplicate"
+        else:
+            seen.add((s, r.get("relation"), o))
+            kp_rels.append(r)
+            stats["relations_kept"] += 1
+            continue
+        stats[f"relations_dropped_{reason}"] += 1
+
+    kp_ents = [
+        e for e in entities
+        if e["id"] in key_ids and _entity_has_valid_span(e, text)
+    ]
+    stats["entities_moved"] += len(kp_ents)
+    stats["entities_dropped_invalid_span"] += len(key_ids) - len(kp_ents)
+
+    g = SkoGraph(**{**graph, "entities": main_ents, "relations": main_rels})
+    g.build_triples()
+    lemma_by_id = {e["id"]: (e.get("lemma") or e.get("text", "")) for e in entities}
+    kp_triples = [
+        {"subject": lemma_by_id[r["subjectId"]], "relation": r["relation"],
+         "object": lemma_by_id[r["objectId"]]}
+        for r in kp_rels
+    ]
+    out = {
+        **record,
+        "graph": g.model_dump(mode="json"),
+        "keyphrases": {"entities": kp_ents, "relations": kp_rels, "triples": kp_triples},
+    }
+    return out, stats
+
+
+# ---------------------------------------------------------------------------
 # spaCy split exports
 # ---------------------------------------------------------------------------
 
@@ -148,8 +244,11 @@ def _split_record_for_spacy(
     """
     text = record.get("input_text", "")
     graph = record.get("graph", {})
-    entities = graph.get("entities", [])
-    relations = graph.get("relations", [])
+    # Po FINAL_EXCLUDE_KEYPHRASES jsou keyphrase entity + jejich relace
+    # v bloku "keyphrases" — pro splity je spojíme zpět.
+    kp_block = record.get("keyphrases") or {}
+    entities = list(graph.get("entities", [])) + list(kp_block.get("entities", []))
+    relations = list(graph.get("relations", [])) + list(kp_block.get("relations", []))
 
     core_ents = [
         e for e in entities
@@ -180,7 +279,7 @@ def _split_record_for_spacy(
 
     def _wrap(ents: list[dict], rels: list[dict]) -> dict:
         return {
-            **{k: v for k, v in record.items() if k != "graph"},
+            **{k: v for k, v in record.items() if k not in ("graph", "keyphrases")},
             "graph": {
                 "entities": ents,
                 "relations": rels,
@@ -808,10 +907,35 @@ def _process_branch(
         r for r in final_records if r.get("critic_status") == "reject"
     ]
 
+    # Keyphrase entity (KEYPHRASE_*) nepatří do NER grafu — přesun do bloku
+    # "keyphrases" v témže záznamu; bezpečné relace se zachovají (viz
+    # _split_keyphrases). Zapnutí/vypnutí: FINAL_EXCLUDE_KEYPHRASES v .env.
+    kp_stats: Counter[str] = Counter()
+    kp_items = 0
+    if CONFIG.final_exclude_keyphrases:
+        split_records: list[dict] = []
+        for r in accepted_records:
+            new_r, st = _split_keyphrases(r)
+            split_records.append(new_r)
+            kp_stats.update(st)
+            kp_items += int("keyphrases" in new_r)
+        accepted_records = split_records
+
     written_jsonl_path, written_json_path = _write_final_outputs(
         out_jsonl_p,
         accepted_records,
     )
+
+    if CONFIG.final_exclude_keyphrases:
+        dropped = {
+            k.replace("relations_dropped_", ""): v
+            for k, v in kp_stats.items() if k.startswith("relations_dropped_")
+        }
+        logger.info(
+            f"[{label}] keyphrase mimo NER graf: {kp_stats['entities_moved']} entit "
+            f"v {kp_items} záznamech → blok 'keyphrases'; relace zachováno "
+            f"{kp_stats['relations_kept']}, zahozeno {sum(dropped.values())} {dropped}"
+        )
 
     # Rejected soubor zapisujeme vždy (i prázdný) — atomický přepis tak nikdy
     # nenechá stát starý reject výstup z předchozího běhu.
@@ -862,6 +986,9 @@ def _process_branch(
         "output_file": str(written_json_path),
         "accepted_items": len(accepted_records),
         "rejected_items": len(rejected_records),
+        "keyphrases_excluded": CONFIG.final_exclude_keyphrases,
+        "keyphrase_items": kp_items,
+        "keyphrase_stats": dict(kp_stats),
         "output_file_rejected_jsonl": str(rejected_jsonl_path),
         "output_file_rejected_json": str(rejected_json_path),
         "extraction_file": str(ext_p),

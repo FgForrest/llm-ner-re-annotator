@@ -239,6 +239,18 @@ class ProgressTracker:
             )
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """Atomický zápis textového souboru (přes tmp + rename) — pro Markdown
+    reporty apod. Stejná crash-safety semantika jako atomic_write_json."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
     """Atomický zápis JSON (přes tmp + rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)
