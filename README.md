@@ -21,7 +21,7 @@ ready to use as training data for a deterministic Stanza/spaCy pipeline.
 - **Chunking:** long texts (>12000 characters, `CHUNK_MAX_CHARS`) are split into sentences; in the finalize phase the chunks of the same document are joined back and entities are remapped onto the merged text
 - **Windows + Linux:** PowerShell + bash scripts, `.gitattributes` fixes line endings
 - **Smoke test profile:** mini models (Qwen3-0.6B + Gemma-3-1b) on an RTX 4070 (12 GB) or similar — shares the same 4-phase design as production
-- **Production smoke test:** `scripts/run_smoke_test.{sh,ps1}` pushes 100 items per dataset through the whole pipeline on the target B200 hardware and extrapolates purely empirically to the full production size (linear `T_full = T_smoke × full_chars/smoke_chars`, ±2h confidence). No theoretical GPU scaling factors — what you measure is what you get.
+- **Production smoke test:** `scripts/run_smoke_test.{sh,ps1}` pushes 100 items per dataset through the whole pipeline on the target B200 hardware — a check of models, backends and the output format before the full production run.
 - **OWL ontology export (smoke test only):** smoke-test `--phase finalize` generates a full OWL 2 ontology — `.owl` (RDF/XML) + `.ttl` (Turtle) + optionally `.html` (via `pylode`). Built with `rdflib` (no hand-written serializers). It contains the TBox (Document/Entity classes + per-label subclasses + per-relation ObjectProperties) and the ABox (Document and Entity individuals + the relations between them). Combined + per-source split.
 
 ## Taxonomy (universal across domains)
@@ -400,7 +400,7 @@ cosine similarity of their profiles.
 ```text
 phase 0: the LLM proposes a taxonomy
    └─ audit (loop):
-        ① measure confusion   ← embeddings (deterministic, ~1 s) OR LLM probe
+        ① measure confusion   ← embeddings (deterministic) OR LLM probe
         ② pick the most confusable pairs
         ③ the LLM sharpens their boundaries (description, decision_rule, counter_examples)
         ④ re-measure (changed descriptions → new embeddings → new score)
@@ -562,7 +562,7 @@ self-loops and duplicates are trimmed. **Triples are not a separate call** —
 they are derived from the relations (`triple = (subject lemma, relation, object lemma)`).
 The `CriticResult` format stays the same, so neither finalize nor revise notice anything.
 
-Cost: ~2× LLM calls per phase (≈ 2× longer run and 2× the tokens). For the original behavior
+Cost: ~2× LLM calls and ~2× the tokens per phase. For the original behavior
 (everything in one call) set `SPLIT_NER_RE=false` in `.env` — no rebuild is
 needed to switch, it is just a runtime flag.
 
@@ -683,13 +683,12 @@ If you change the tags in `.env`, make sure both images are explicitly built
 against CUDA 13 (the tag typically contains `-cu130` or `cuda13`). Otherwise NVFP4
 inference fails with `no kernel image is available for execution on the device`.
 
-## Hardware and estimates
+## Hardware
 
 Target hardware: **NVIDIA Blackwell B200** (1×, 2×, 4× or 8× cards) or
 **NVIDIA RTX PRO 6000 Blackwell** (2×, 4× or 8× cards). **NVIDIA A100 40 GB**
 (4× or 8× cards) is supported too — but it uses a different quantization and only
-vLLM (see below). You find out the real runtime with the **production smoke test** below —
-no static estimates, what you measure is what you get.
+vLLM (see below).
 
 `run_production` and `run_smoke_test` ask at the start for the **GPU type**
 (the one detected via `nvidia-smi` is preselected) and then for the **count**:
@@ -808,19 +807,15 @@ the current values from `.env` and Enter keeps them. You can turn that question 
 `THROUGHPUT_PROMPT=0`; a non-interactive run does not ask at all. The optimum for these values
 is measured by `./scripts/auto_tune_concurrency.sh`.
 
-### Production smoke test (purely empirical estimate)
+### Production smoke test
 
-⚠️ **The previous "indicative" tables turned out to be far off from the real time in practice.**
-Instead of a static estimate, the pipeline includes a **production smoke test** that
-runs the pipeline on a sample of 100 items from each dataset on **exactly the
-hardware production will run on**, and extrapolates linearly:
+The pipeline includes a **production smoke test** that runs the pipeline on a sample
+of 100 items from each dataset on **exactly the hardware production will run on** —
+to check the models, backends and the output format before the full run.
 
-```
-T_full = T_smoke × (full_chars / smoke_chars)
-```
-
-No theoretical scaling factors, no GPU-class projections, no
-"constant model-load" estimates. What you measure is what you get in the estimate.
+> **Note on time:** the runtime of the full run that the smoke test extrapolates from
+> the sample (as well as the ETA in the phase logs) is really only an estimate — the
+> real time can differ greatly.
 
 #### Usage (one-liner script)
 
@@ -832,7 +827,7 @@ The default run uses **docker** (LLM servers + labeler in containers):
 HW_LABEL="2x B200" ./scripts/run_smoke_test.sh
 GPU_TYPE=rtxpro6000 GPU_COUNT=2 ./scripts/run_smoke_test.sh    # 2x RTX PRO 6000
 GPU_TYPE=a100 GPU_COUNT=4 ./scripts/run_smoke_test.sh          # 4x A100 40GB (INT4 + vLLM)
-SAMPLES_PER_DATASET=100 ./scripts/run_smoke_test.sh             # a more accurate estimate
+SAMPLES_PER_DATASET=100 ./scripts/run_smoke_test.sh             # number of items per dataset
 
 # Windows:
 .\scripts\run_smoke_test.ps1
@@ -922,7 +917,7 @@ For finalize: no LLM, just `docker compose --profile finalize run`.
 A report at the end.
 
 `HW_LABEL` is only **descriptive text** in the report — it is not used in any
-calculation. For an estimate on different hardware, just run the smoke test again on that hardware.
+calculation. To test different hardware, run the smoke test again on that hardware.
 
 #### Manual usage (per phase)
 
@@ -950,35 +945,7 @@ The smoke output is in the **`checkpoints/smoke/` subfolder** — it does not to
 production `checkpoints/extractions.jsonl` etc. (override with the
 `SMOKE_CHECKPOINT_DIR` env variable).
 
-#### How accurate the estimate is
-
-The smoke test runs **on the same hardware, with the same models, on real items
-from each dataset** (100 per dataset by default). The extrapolation formula is purely
-linear:
-
-| Phase | Formula | Reason |
-|------|--------|-------|
-| extract / critic / revise | `T_smoke × (full_chars / smoke_chars)` | LLM cost scales with tokens ≈ chars |
-| revise | × `nonok_rate` | only a subset of items needs revision |
-| finalize | `T_smoke × (full_items / smoke_items)` | CPU only, per-item operations |
-
-What is NOT used:
-- ❌ Theoretical GPU scaling factors (1.8x, 3.4x …) — the smoke test runs on the hardware production will run on, so no projections are needed
-- ❌ A constant "model load" overhead — the user pays that once at `docker compose up` OUTSIDE the smoke wall-clock; in the report it is only optional via `--docker-startup-s`
-- ❌ Hardcoded throughput tables for different GPU classes
-
-What IS measured:
-- ✅ Wall-clock directly on the target hardware
-- ✅ The critic non-ok rate (typically 25–35 %) — it is not guessed
-- ✅ Per-dataset items + chars (for the linear extrapolation)
-
-Confidence interval ±2h:
-- Bootstrap from per-item timings, 95 % CI
-- A 5 % floor for unmeasurable production factors (HW noise, batch scheduler, sample bias)
-- sqrt-of-sum-of-squares across phases
-- Capped at ±2h with a warning if the target is not met (recommends increasing `--samples-per-dataset`)
-
-### Live progress + ETA in the log
+### Live progress in the log
 
 Every phase logs at start, periodically while running, and at the end:
 
@@ -996,7 +963,7 @@ What the columns mean:
 - `errors=N` — how many items failed even after the self-repair retry
 - `skipped=N` — how many items hit the hash cache (an identical text was already labeled)
 - `elapsed=Xh Ymin` — how long the phase has been running
-- `ETA=Xh Ymin` — estimated remaining time (from the average speed of actually processed items)
+- `ETA=Xh Ymin` — remaining time, computed from the average speed of the items processed so far
 - `(47.4 it/min)` — current throughput
 
 Adaptive logging — the frequency is tuned to the dataset size (about 25 log lines per phase).
@@ -1299,7 +1266,7 @@ mudrc-labeler/
 │   ├── relation_normalize.py         # Relation type rules + reverse fix + drop type-mismatch
 │   ├── finalize.py                   # PHASE 3: merge + stats
 │   ├── rdf_export.py                 # OWL/RDF export via rdflib (.owl + .ttl + optionally .html, smoke only)
-│   ├── smoke_test.py                 # Production smoke test — empirical time estimate
+│   ├── smoke_test.py                 # Production smoke test
 │   ├── config.py                     # Env config (EXTRACTOR_*, CRITIC_*, REVISOR_*)
 │   └── main.py                       # CLI entry point
 ├── examples/
@@ -1316,7 +1283,7 @@ mudrc-labeler/
 │   ├── download_models.sh            # Downloads the HF models
 │   ├── run_production.sh             # Production run (Linux) — docker | native
 │   ├── run_production.ps1            # Production run (Windows)
-│   ├── run_smoke_test.sh             # Production smoke test (Linux) — empirical time estimate
+│   ├── run_smoke_test.sh             # Production smoke test (Linux)
 │   ├── run_smoke_test.ps1            # Production smoke test (Windows)
 │   ├── install_sglang.sh             # Auto-install SGLang + flashinfer (Linux, native mode)
 │   ├── install_sglang.ps1            # Auto-install SGLang (Windows)
@@ -1598,9 +1565,9 @@ accept the license, generate a token at huggingface.co/settings/tokens,
 and put it into `.env` as `HF_TOKEN=hf_...`. The NVFP4 version (`nvidia/Gemma-4-31B-IT-NVFP4`)
 requires the same consent.
 
-**The server takes 10+ minutes to load**
+**The server takes a long time to load**
 → Normal for Qwen3.5-122B, the first start compiles CUDA kernels.
-If you start it again on the same MODEL_CACHE_DIR, it takes ~2 min.
+Later starts on the same MODEL_CACHE_DIR are much faster.
 
 **First (cold) run: the container gets torn down / `rc=1` / "it did not finish in time"**
 → The first download of the weights from HF (Qwen3.5-122B-NVFP4 ~80 GB) can exceed the docker
